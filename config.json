@@ -1,0 +1,97 @@
+{
+  "timezone": "Europe/Berlin",
+  "folders": {
+    "lav_interviewer": "lav_interviewer",
+    "lav_befragter": "lav_befragter",
+    "sony": "sony",
+    "gopro": "gopro"
+  },
+  "track_names": {
+    "lav_interviewer": "Lav Interviewer",
+    "lav_befragter": "Lav Befragter",
+    "sony": "Sony Kamera-Ton",
+    "gopro": "GoPro-Ton"
+  },
+  "output": {
+    "file": "interview_merged.mov",
+    "dir": null,
+    "width": 1920,
+    "height": 1080,
+    "fps": 25,
+    "vcodec": "x265",
+    "crf": null,
+    "preset": "medium",
+    "bitrate": "3M",
+    "audio_rate": 48000,
+    "audio_codec": "aac",
+    "audio_tracks": "single",
+    "aac_single": "384k",
+    "aac_mono": "96k",
+    "aac_stereo": "160k"
+  },
+  "sources": {
+    "lav_interviewer": {
+      "offset_s": 0.0,
+      "tags_are_utc": true,
+      "channels": "mono"
+    },
+    "lav_befragter": {
+      "offset_s": 0.0,
+      "tags_are_utc": true,
+      "channels": "mono"
+    },
+    "sony": {
+      "offset_s": 0.0,
+      "tags_are_utc": true,
+      "channels": "mono",
+      "use_timecode": false
+    },
+    "gopro": {
+      "offset_s": 0.0,
+      "tags_are_utc": false,
+      "channels": "mono"
+    }
+  },
+  "join_tolerance_s": 3.0,
+  "cut_gaps": {
+    "enabled": true,
+    "min_gap_s": 10.0,
+    "keep_s": 2.0
+  },
+  "audio_processing": {
+    "enabled": true,
+    "apply_to": [
+      "lav_interviewer",
+      "lav_befragter",
+      "sony",
+      "gopro"
+    ],
+    "highpass_hz": 90,
+    "denoise": "afftdn",
+    "denoise_db": 12,
+    "rnnoise_model": null,
+    "normalize": true,
+    "max_gain_db": 20,
+    "target_rms": 0.12
+  },
+  "pip": {
+    "width_fraction": 0.3,
+    "margin": 40
+  },
+  "text": {
+    "fontfile": null,
+    "size": 34
+  },
+  "audio_sync": {
+    "enabled": true,
+    "lav_to_lav": true,
+    "coarse": true,
+    "coarse_min_ratio": 1.5,
+    "coarse_min_overlap_s": 120,
+    "search_s": 10.0,
+    "analyze_s": 30.0,
+    "window_step_s": 240.0,
+    "min_confidence": 8.0,
+    "drift_min_span_s": 600.0
+  }
+}

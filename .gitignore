@@ -1,0 +1,22 @@
+# Python-Umgebung
+.venv/
+__pycache__/
+
+# Quellmaterial
+lav_interviewer/
+lav_befragter/
+sony/
+gopro/
+
+# Ergebnisse und Zwischendateien
+imerge_*/
+*.mov
+*.mp4
+*.MP4
+*.wav
+*.WAV
+*_report.txt
+interview_merge_report.txt
+
+# macOS
+.DS_Store
