@@ -29,6 +29,8 @@ Ergebnis ist eine einzige `.mov`-Datei mit Bild, allen Tonquellen als getrennten
 
 ## Schnellstart
 
+### macOS
+
 In jedem neuen Terminal, im Projektordner:
 
 ```bash
@@ -39,7 +41,39 @@ python3 interview_merge.py .              # rendern
 
 `setup.sh` prüft und installiert bei Bedarf alles Nötige: Homebrew-Check, `ffmpeg-full`, Python-Umgebung `.venv` mit numpy und Zeitzonendaten. Danach setzt es PATH und Umgebung für **dieses** Terminalfenster und zeigt, welche Quellordner gefunden wurden. Es muss mit `source` gestartet werden, sonst gelten die Einstellungen nicht im Terminal.
 
-Die folgenden Abschnitte beschreiben, was `setup.sh` macht, falls du es von Hand einrichten willst.
+Die Abschnitte unter „Installation von Hand (macOS)“ beschreiben, was `setup.sh` macht, falls du es von Hand einrichten willst.
+
+### Windows
+
+In jedem neuen **PowerShell**-Fenster, im Projektordner:
+
+```powershell
+. .\setup.ps1
+python interview_merge.py . --dry-run    # Zeiten prüfen
+python interview_merge.py .              # rendern
+```
+
+Wichtig ist der **Punkt mit Leerzeichen** vor `.\setup.ps1`. Nur so gelten PATH und Python-Umgebung danach im Fenster.
+
+`setup.ps1` installiert bei Bedarf über `winget`:
+- **ffmpeg** (Gyan-Build `Gyan.FFmpeg`, enthält Texte/drawtext, x265 und die Tonfilter)
+- **Python 3.12**, falls kein Python 3.9+ vorhanden ist
+- die Python-Umgebung `.venv` mit numpy und tzdata (Zeitzonendaten, die Windows-Python sonst fehlen)
+
+Danach zeigt es, welche Quellordner gefunden wurden und welche Hardware-Encoder ffmpeg kennt.
+
+**Einmalig vorab**, falls PowerShell meldet, dass Skripte deaktiviert sind:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+Hast du `setup.ps1` aus dem Internet heruntergeladen statt per Git geholt, blockiert Windows es zusätzlich. Dann einmal `Unblock-File .\setup.ps1` ausführen.
+
+**Unterschiede zu macOS:**
+- Der Befehl heißt `python` statt `python3`.
+- Pfade schreibst du wie gewohnt mit Laufwerksbuchstaben, in Anführungszeichen, wenn Leerzeichen vorkommen: `python interview_merge.py "E:\Porsche\Interview 1" -o "E:\Export" -n "Interview 1"`.
+- Statt `hevc_videotoolbox` gibt es schnelle Hardware-Encoder je nach Grafikkarte: `"vcodec": "hevc_nvenc"` (NVIDIA), `"hevc_qsv"` (Intel) oder `"hevc_amf"` (AMD). Die Bitrate stellst du über `"bitrate"` ein.
 
 ## Installation von Hand (macOS)
 
@@ -91,7 +125,8 @@ source .venv/bin/activate
 ```
 projekt/
 ├── interview_merge.py
-├── setup.sh                 Terminal vorbereiten: source setup.sh
+├── setup.sh                 macOS: Terminal vorbereiten (source setup.sh)
+├── setup.ps1                Windows: PowerShell vorbereiten (. .\setup.ps1)
 ├── config.json              (optional, aber empfohlen)
 ├── lav_interviewer/         DJI Mic 2 – Interviewer
 ├── lav_befragter/           DJI Mic 2 – Befragte*r
@@ -250,10 +285,10 @@ Bezeichnungen der Tonspuren bzw. Kanäle, auch für die Einblendungen der Lavs.
 | `dir` | `null` | Ausgabeordner (`null` = Projektordner). `--output` hat Vorrang. |
 | `width` / `height` | `1920` / `1080` | Auflösung. `1280` / `720` halbiert ungefähr die Dateigröße. |
 | `fps` | `25` | Bildrate der Ausgabe |
-| `vcodec` | `"x265"` | `"x265"`: klein bei guter Qualität (Standard)<br>`"hevc_videotoolbox"`: Mac-Hardware, deutlich schneller, etwas größer<br>`"libx264"`: H.264<br>`"h264_videotoolbox"`: H.264 per Hardware<br>`"prores"`: ProRes Proxy, groß, ideal zum Weiterschneiden |
+| `vcodec` | `"x265"` | `"x265"`: klein bei guter Qualität (Standard)<br>`"hevc_videotoolbox"`: Mac-Hardware, deutlich schneller, etwas größer<br>`"hevc_nvenc"` / `"hevc_qsv"` / `"hevc_amf"`: Windows-Hardware (NVIDIA / Intel / AMD), deutlich schneller<br>`"libx264"`: H.264<br>`"h264_videotoolbox"`: H.264 per Hardware<br>`"prores"`: ProRes Proxy, groß, ideal zum Weiterschneiden |
 | `crf` | `null` | Qualität bei x265/x264. `null` = Standard (x265: 28, x264: 23). Höher heißt kleiner und schlechter; ab ca. 32 sichtbar. |
 | `preset` | `"medium"` | Encoder-Geschwindigkeit bei x265/x264: `ultrafast` … `slow`. Langsamer heißt kleiner. |
-| `bitrate` | `"3M"` | Nur für die `*_videotoolbox`-Codecs |
+| `bitrate` | `"3M"` | Nur für die Hardware-Codecs (`*_videotoolbox`, `*_nvenc`, `*_qsv`, `*_amf`) |
 | `audio_rate` | `48000` | Abtastrate des Tons |
 | `audio_codec` | `"aac"` | `"aac"` (klein) oder `"pcm"` (verlustfrei, ca. 10 GB pro 3 h zusätzlich) |
 | `audio_tracks` | `"single"` | `"single"`: 1 Spur mit 4 Kanälen (Resolve-sicher)<br>`"separate"`: 4 einzelne Spuren |
@@ -337,7 +372,9 @@ Aufbereitung der Tonspuren für automatische Transkription. Sie wird nach dem Sy
 | Problem | Ursache / Lösung |
 |---|---|
 | `ffmpeg ohne drawtext – Dateinamen werden NICHT eingeblendet` | Es läuft das Standard-ffmpeg. `source setup.sh` ausführen. |
-| `numpy fehlt` | Terminal nicht vorbereitet: `source setup.sh`. |
+| `numpy fehlt` | Terminal nicht vorbereitet: `source setup.sh` (macOS) bzw. `. .\setup.ps1` (Windows). |
+| Windows: „Ausführung von Skripts ist auf diesem System deaktiviert“ | Einmalig `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, ggf. `Unblock-File .\setup.ps1`. |
+| Windows: `python` öffnet den Microsoft Store | Das ist nur ein Platzhalter. `. .\setup.ps1` installiert echtes Python; danach PowerShell neu öffnen. |
 | Eine Kamera ist um mehrere Stunden verschoben | Falsche `timezone`, oder `tags_are_utc` passt bei dieser Kamera nicht. Mit `--dry-run` prüfen. |
 | Kamera um feste Sekunden/Minuten daneben, Grobsuche sagt „kein eindeutiger Treffer“ | Kamera-Ton zu schlecht (Gehäuse, Wind). Versatz von Hand bestimmen, z.B. über ein Klatschen, und als `offset_s` eintragen. |
 | Timeline viel zu lang | Versehentliche Aufnahmen weit außerhalb des Drehs (z.B. eine kurze DJI-Datei Stunden später) aus den Ordnern nehmen. Pausen dazwischen werden sonst geschnitten, aber die Datei selbst bleibt drin. |

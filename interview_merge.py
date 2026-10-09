@@ -64,6 +64,7 @@ DEFAULT_CONFIG = {
         "dir": None,   # Ausgabeordner (null = Projektordner); --output überschreibt das
         "width": 1920, "height": 1080, "fps": 25,
         # "x265" (klein, Standard) | "hevc_videotoolbox" (Mac, schnell) |
+        # "hevc_nvenc" / "hevc_qsv" / "hevc_amf" (Windows: NVIDIA / Intel / AMD, schnell) |
         # "libx264" | "h264_videotoolbox" | "prores" (Proxy, groß, zum Schneiden)
         # crf: null = Standard (x265: 28, x264: 23). Höher = kleiner/schlechter.
         "vcodec": "x265", "crf": None, "preset": "medium", "bitrate": "3M",
@@ -117,6 +118,7 @@ FONT_CANDIDATES = [
     "/System/Library/Fonts/Helvetica.ttc",
     "/Library/Fonts/Arial.ttf",
     "C:/Windows/Fonts/arial.ttf",
+    "C:/Windows/Fonts/segoeui.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/TTF/DejaVuSans.ttf",
 ]
@@ -158,7 +160,11 @@ def hms(sec, frac=True):
 
 
 def filter_quote(path):
-    return "'" + str(path).replace("\\", "/").replace("'", "'\\''") + "'"
+    """Pfad sicher in einen ffmpeg-Filter einsetzen (auch C:/..., Leerzeichen, Apostrophe).
+    Zwei Ebenen: Filter-Optionen (\\ ' : escapen), dann Filtergraph (in '...' einpacken)."""
+    p = str(path).replace("\\", "/")
+    p = p.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+    return "'" + p.replace("'", "'\\''") + "'"
 
 
 # --------------------------------------------------------------------------- clips
@@ -643,6 +649,9 @@ def vcodec_args(o):
         return ["-c:v", "hevc_videotoolbox", "-b:v", o.get("bitrate", "3M"), "-pix_fmt", "yuv420p", "-tag:v", "hvc1"]
     if v == "prores":
         return ["-c:v", "prores_ks", "-profile:v", "0", "-pix_fmt", "yuv422p10le", "-vendor", "apl0"]
+    if v.endswith(("_nvenc", "_qsv", "_amf")):   # Windows/Linux-Hardware: NVIDIA, Intel, AMD
+        args = ["-c:v", v, "-b:v", o.get("bitrate", "3M"), "-pix_fmt", "yuv420p"]
+        return args + (["-tag:v", "hvc1"] if v.startswith("hevc") else [])
     if v == "h264_videotoolbox":
         return ["-c:v", "h264_videotoolbox", "-b:v", o.get("bitrate", "6M"), "-pix_fmt", "yuv420p"]
     return ["-c:v", "libx264", "-crf", str(o.get("crf") or 23), "-preset", o["preset"], "-pix_fmt", "yuv420p"]
@@ -843,7 +852,7 @@ def main():
     cfg = DEFAULT_CONFIG
     cfg_path = args.config or root / "config.json"
     if cfg_path.exists():
-        cfg = deep_merge(cfg, json.loads(cfg_path.read_text()))
+        cfg = deep_merge(cfg, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
         print(f"Config: {cfg_path}")
 
     global TARGET_TZ
@@ -943,7 +952,7 @@ def main():
                 print(f"  Segment {i}/{len(segs)}  {hms(a / fps)} – {hms(b / fps)}  {name}")
                 seg = tmp / f"seg_{i:05d}.mov"
                 r.render(seg, a, b, main, pip, lavs)
-                lf.write(f"file '{seg.as_posix()}'\n")
+                lf.write(f"file '{seg.as_posix().replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n")
 
         print("Füge zusammen ...")
         video = tmp / "video.mov"
