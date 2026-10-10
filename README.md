@@ -43,7 +43,21 @@ python3 interview_merge.py .              # rendern
 
 Die Abschnitte unter „Installation von Hand (macOS)“ beschreiben, was `setup.sh` macht, falls du es von Hand einrichten willst.
 
-### Windows
+### Windows (Eingabeaufforderung / cmd)
+
+In jedem neuen **cmd**-Fenster, im Projektordner:
+
+```bat
+setup
+python interview_merge.py . --dry-run    # Zeiten prüfen
+python interview_merge.py .              # rendern
+```
+
+`setup.bat` macht dasselbe wie die PowerShell-Variante unten, braucht aber keine Freigabe für Skripte. **Nicht per Doppelklick starten**: Dann öffnet sich ein eigenes Fenster, das sich danach schließt, und die Einstellungen sind weg.
+
+cmd im Projektordner öffnen: im Explorer in die Adresszeile `cmd` tippen und Enter drücken.
+
+### Windows (PowerShell)
 
 In jedem neuen **PowerShell**-Fenster, im Projektordner:
 
@@ -127,6 +141,7 @@ projekt/
 ├── interview_merge.py
 ├── setup.sh                 macOS: Terminal vorbereiten (source setup.sh)
 ├── setup.ps1                Windows: PowerShell vorbereiten (. .\setup.ps1)
+├── setup.bat                Windows: cmd vorbereiten (setup)
 ├── config.json              (optional, aber empfohlen)
 ├── lav_interviewer/         DJI Mic 2 – Interviewer
 ├── lav_befragter/           DJI Mic 2 – Befragte*r
@@ -372,7 +387,8 @@ Aufbereitung der Tonspuren für automatische Transkription. Sie wird nach dem Sy
 | Problem | Ursache / Lösung |
 |---|---|
 | `ffmpeg ohne drawtext – Dateinamen werden NICHT eingeblendet` | Es läuft das Standard-ffmpeg. `source setup.sh` ausführen. |
-| `numpy fehlt` | Terminal nicht vorbereitet: `source setup.sh` (macOS) bzw. `. .\setup.ps1` (Windows). |
+| `numpy fehlt` | Terminal nicht vorbereitet: `source setup.sh` (macOS), `setup` (Windows cmd) bzw. `. .\setup.ps1` (Windows PowerShell). |
+| Windows cmd: Fehler wie „Sprungmarke nicht gefunden“ | `setup.bat` hat Mac-/Linux-Zeilenenden bekommen. Die beiliegende `.gitattributes` verhindert das bei Git; sonst die Datei in einem Editor mit Windows-Zeilenenden (CRLF) speichern. |
 | Windows: „Ausführung von Skripts ist auf diesem System deaktiviert“ | Einmalig `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, ggf. `Unblock-File .\setup.ps1`. |
 | Windows: `python` öffnet den Microsoft Store | Das ist nur ein Platzhalter. `. .\setup.ps1` installiert echtes Python; danach PowerShell neu öffnen. |
 | Eine Kamera ist um mehrere Stunden verschoben | Falsche `timezone`, oder `tags_are_utc` passt bei dieser Kamera nicht. Mit `--dry-run` prüfen. |
