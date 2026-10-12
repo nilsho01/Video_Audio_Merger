@@ -48,7 +48,7 @@
     },
     "gopro": {
       "offset_s": 0.0,
-      "tags_are_utc": false,
+      "tags_are_utc": true,
       "channels": "mono"
     }
   },
@@ -88,6 +88,7 @@
     "coarse": true,
     "coarse_min_ratio": 1.5,
     "coarse_min_overlap_s": 120,
+    "coarse_local_s": 300.0,
     "search_s": 10.0,
     "analyze_s": 30.0,
     "window_step_s": 240.0,

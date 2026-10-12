@@ -317,7 +317,7 @@ Pro Quelle (`lav_interviewer`, `lav_befragter`, `sony`, `gopro`):
 | Schlüssel | Bedeutung |
 |---|---|
 | `offset_s` | Manuelle Korrektur in Sekunden. Positiv heißt später. Für Fälle, in denen der automatische Sync nichts findet. Liegt der Wert auf wenige Sekunden genau, erledigt der Feinsync den Rest. |
-| `tags_are_utc` | Ob der `creation_time`-Tag echte UTC ist (`true`, z.B. Sony) oder nur die Ortszeit mit falschem „Z“ (`false`, viele GoPros). Ist eine Kamera um genau die Zeitzonendifferenz verschoben, diesen Wert umdrehen. Die Grobsuche korrigiert das aber meist automatisch. |
+| `tags_are_utc` | Ob der `creation_time`-Tag echte UTC ist (`true`, z.B. Sony) oder nur die Ortszeit mit falschem „Z“ (`false`). Standard ist überall `true`; die eingesetzte GoPro schreibt nachweislich echte UTC. Ist eine Kamera um genau die Zeitzonendifferenz verschoben, diesen Wert umdrehen. Die Grobsuche korrigiert das aber meist automatisch. |
 | `channels` | `"mono"` oder `"stereo"`. Bei `"single"` wird ohnehin jede Quelle mono. |
 | `use_timecode` | Nur Sony: Uhrzeit aus dem Timecode nehmen. Nur sinnvoll, wenn die Kamera auf Time-of-Day-Timecode steht. |
 
@@ -374,6 +374,7 @@ Aufbereitung der Tonspuren für automatische Transkription. Sie wird nach dem Sy
 | `coarse` | `true` | Grobsuche über die ganze Aufnahme (findet große Uhrzeitfehler) |
 | `coarse_min_ratio` | `1.5` | Mindest-Eindeutigkeit der Grobsuche. Niedriger übernimmt mehr, aber riskanter. |
 | `coarse_min_overlap_s` | `120` | Mindestüberlappung zwischen Kamera und Lavs für einen Treffer |
+| `coarse_local_s` | `300` | Ist die globale Suche nicht eindeutig, wird zusätzlich nur in diesem Fenster (±Sekunden) um die Kamera-Uhrzeit gesucht. Setzt voraus, dass Zeitzone und `tags_are_utc` stimmen. `0` = aus. |
 | `search_s` | `10` | Suchbereich der Feinsuche (±Sekunden) |
 | `analyze_s` | `30` | Länge eines Messfensters |
 | `window_step_s` | `240` | Abstand der Messfenster im Clip |

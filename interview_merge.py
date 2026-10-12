@@ -80,7 +80,7 @@ DEFAULT_CONFIG = {
         "lav_interviewer": {"offset_s": 0.0, "tags_are_utc": True, "channels": "mono"},
         "lav_befragter": {"offset_s": 0.0, "tags_are_utc": True, "channels": "mono"},
         "sony": {"offset_s": 0.0, "tags_are_utc": True, "channels": "mono", "use_timecode": False},
-        "gopro": {"offset_s": 0.0, "tags_are_utc": False, "channels": "mono"},
+        "gopro": {"offset_s": 0.0, "tags_are_utc": True, "channels": "mono"},
     },
     # Zeitzone, in der die Geräte-Uhren (DJI, GoPro) laufen, z.B. "Europe/Berlin".
     # Zeitstempel mit Zonenangabe (Sony-XML, UTC-Tags) werden in diese Zone umgerechnet.
@@ -106,6 +106,7 @@ DEFAULT_CONFIG = {
     "pip": {"width_fraction": 0.3, "margin": 40},
     "text": {"fontfile": None, "size": 34},
     "audio_sync": {"enabled": True, "coarse": True, "coarse_min_ratio": 1.5, "coarse_min_overlap_s": 120,
+                   "coarse_local_s": 300.0,
                    "search_s": 10.0, "analyze_s": 30.0, "window_step_s": 240.0,
                    "min_confidence": 8.0, "drift_min_span_s": 600.0,
                    "lav_to_lav": True},
@@ -487,30 +488,37 @@ def coarse_offset(clips, lav_clips, lav_wavs, total, scfg):
     # deshalb mit der Wurzel der Überlappung gewichten (~ z-Wert)
     score = ncc * np.sqrt(np.maximum(ov, 0))
     score[ov < scfg.get("coarse_min_overlap_s", 120)] = -np.inf
-    j = int(np.argmax(score))
-    if not np.isfinite(score[j]):
-        return None
-    peak = float(ncc[j])
-    g = rate * 5
-    masked = score.copy()
-    masked[max(0, j - g):j + g + 1] = -np.inf
-    second = float(masked.max()) if np.isfinite(masked.max()) else 0.0
-    ratio = float(score[j]) / max(second, 1e-3)
+    offs = (np.arange(len(score)) - (len(cam) - 1)) / rate - c0
+
+    def pick(sc):
+        j = int(np.argmax(sc))
+        if not np.isfinite(sc[j]):
+            return None
+        g = rate * 5
+        masked = sc.copy()
+        masked[max(0, j - g):j + g + 1] = -np.inf
+        second = float(masked.max()) if np.isfinite(masked.max()) else 0.0
+        return {"off": float(offs[j]), "ratio": float(sc[j]) / max(second, 1e-3),
+                "peak": float(ncc[j]), "ov": float(ov[j])}
+
     # Top-3-Kandidaten zur Kontrolle ausgeben
-    cand, sc = [], score.copy()
+    sc = score.copy()
     for _ in range(3):
         i = int(np.argmax(sc))
         if not np.isfinite(sc[i]):
             break
-        cand.append((i, float(sc[i])))
-        sc[max(0, i - rate * 30):i + rate * 30 + 1] = -np.inf
-    for i, v in cand:
-        o = (i - (len(cam) - 1)) / rate - c0
-        print(f"       Kandidat {o:+9.1f}s ({hms(o, False)})  Score {v:6.1f}  "
+        print(f"       Kandidat {offs[i]:+9.1f}s ({hms(offs[i], False)})  Score {sc[i]:6.1f}  "
               f"Treffer {ncc[i]:.2f}  Überlappung {hms(ov[i], False)}")
-    k = j - (len(cam) - 1)
-    off = k / rate - c0
-    return off, ratio, peak, float(ov[j])
+        sc[max(0, i - rate * 30):i + rate * 30 + 1] = -np.inf
+
+    glob = pick(score)
+    local = None
+    W = float(scfg.get("coarse_local_s") or 0)
+    if W > 0:
+        sc = score.copy()
+        sc[np.abs(offs) > W] = -np.inf
+        local = pick(sc)
+    return (glob, local) if glob else None
 
 
 def refine_sync(cam_clips, lav_wavs, scfg, total, lav_clips=()):
@@ -527,20 +535,29 @@ def refine_sync(cam_clips, lav_wavs, scfg, total, lav_clips=()):
             if res is None:
                 print(f"  -> {src}: zu wenig Überlappung mit den Lavs")
                 continue
-            off, ratio, peak, ov = res
-            print(f"     Versatz {off:+.1f}s ({hms(off)}), Treffer {peak:.2f}, "
-                  f"Abstand {ratio:.2f}x, Überlappung {hms(ov, False)}")
-            ok = ratio >= scfg.get("coarse_min_ratio", 1.5) and peak >= 0.15
-            if ok and abs(off) > S / 2:
-                print(f"  -> {src}: alle Clips um {off:+.1f}s verschoben")
-                for c in group:
-                    c.start += off
-                    c.sync_note = f"Grob {off:+.1f}s; "
-            elif ok:
-                print(f"  -> {src}: Uhrzeit passt, Rest macht der Feinsync")
-            else:
+            glob, local = res
+            min_ratio = scfg.get("coarse_min_ratio", 1.5)
+            good = lambda r: r is not None and r["ratio"] >= min_ratio and r["peak"] >= 0.15
+            print(f"     Global: Versatz {glob['off']:+.1f}s ({hms(glob['off'])}), Treffer {glob['peak']:.2f}, "
+                  f"Abstand {glob['ratio']:.2f}x, Überlappung {hms(glob['ov'], False)}")
+            chosen = glob if good(glob) else None
+            if chosen is None and local is not None:
+                W = float(scfg.get("coarse_local_s") or 0)
+                print(f"     Global nicht eindeutig – suche nur ±{hms(W, False)} um die Kamera-Uhrzeit:")
+                print(f"     Lokal:  Versatz {local['off']:+.1f}s ({hms(local['off'])}), Treffer {local['peak']:.2f}, "
+                      f"Abstand {local['ratio']:.2f}x, Überlappung {hms(local['ov'], False)}")
+                if good(local):
+                    chosen = local
+            if chosen is None:
                 print(f"  -> {src}: kein eindeutiger Treffer – Zeiten bleiben wie erkannt "
-                      f"(ggf. offset_s in config.json setzen)")
+                      f"(ggf. tags_are_utc oder offset_s in config.json prüfen)")
+            elif abs(chosen["off"]) > S / 2:
+                print(f"  -> {src}: alle Clips um {chosen['off']:+.1f}s verschoben")
+                for c in group:
+                    c.start += chosen["off"]
+                    c.sync_note = f"Grob {chosen['off']:+.1f}s; "
+            else:
+                print(f"  -> {src}: Uhrzeit passt, Rest macht der Feinsync")
     # 2) Feinsync über den ganzen Clip inkl. Drift
     fine_sync(cam_clips, lav_wavs, scfg)
 
