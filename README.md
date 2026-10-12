@@ -300,9 +300,11 @@ Bezeichnungen der Tonspuren bzw. Kanäle, auch für die Einblendungen der Lavs.
 | `dir` | `null` | Ausgabeordner (`null` = Projektordner). `--output` hat Vorrang. |
 | `width` / `height` | `1920` / `1080` | Auflösung. `1280` / `720` halbiert ungefähr die Dateigröße. |
 | `fps` | `25` | Bildrate der Ausgabe |
-| `vcodec` | `"x265"` | `"x265"`: klein bei guter Qualität (Standard)<br>`"hevc_videotoolbox"`: Mac-Hardware, deutlich schneller, etwas größer<br>`"hevc_nvenc"` / `"hevc_qsv"` / `"hevc_amf"`: Windows-Hardware (NVIDIA / Intel / AMD), deutlich schneller<br>`"libx264"`: H.264<br>`"h264_videotoolbox"`: H.264 per Hardware<br>`"prores"`: ProRes Proxy, groß, ideal zum Weiterschneiden |
+| `vcodec` | `"auto"` | `"auto"`: schnellster funktionierender Hardware-Encoder (Mac: `hevc_videotoolbox`, Windows: `hevc_nvenc`/`hevc_qsv`/`hevc_amf`), sonst x265. Das Skript macht dazu vor dem Rendern einen kurzen Probelauf.<br>`"x265"`: Software, am kleinsten, aber deutlich langsamer<br>`"hevc_videotoolbox"`, `"hevc_nvenc"`, `"hevc_qsv"`, `"hevc_amf"`: Hardware fest wählen<br>`"libx264"`, `"h264_videotoolbox"`: H.264<br>`"prores"`: ProRes Proxy, groß, ideal zum Weiterschneiden |
 | `crf` | `null` | Qualität bei x265/x264. `null` = Standard (x265: 28, x264: 23). Höher heißt kleiner und schlechter; ab ca. 32 sichtbar. |
-| `preset` | `"medium"` | Encoder-Geschwindigkeit bei x265/x264: `ultrafast` … `slow`. Langsamer heißt kleiner. |
+| `preset` | `"fast"` | Encoder-Geschwindigkeit bei x265/x264: `ultrafast` … `slow`. Langsamer heißt kleiner. |
+| `hwaccel` | `"auto"` | Quellvideos per Hardware decodieren (spart viel Zeit bei 4K). Fällt automatisch auf Software zurück. `"none"` = aus. |
+| `jobs` | `"auto"` | So viele Segmente werden gleichzeitig gerendert. `"auto"` = 3 bei Hardware-Encoder, 1 bei x265. |
 | `bitrate` | `"3M"` | Nur für die Hardware-Codecs (`*_videotoolbox`, `*_nvenc`, `*_qsv`, `*_amf`) |
 | `audio_rate` | `48000` | Abtastrate des Tons |
 | `audio_codec` | `"aac"` | `"aac"` (klein) oder `"pcm"` (verlustfrei, ca. 10 GB pro 3 h zusätzlich) |
@@ -398,4 +400,4 @@ Aufbereitung der Tonspuren für automatische Transkription. Sie wird nach dem Sy
 | Resolve zeigt nur 2 Tonspuren | Siehe Abschnitt „In DaVinci Resolve importieren“. |
 | Anfang des Videos ist stumm | Normal, wenn eine Kamera schon vor den Lavs lief. Der Lav-Ton beginnt erst später. |
 | Ton klingt „blechern“ oder verwaschen | Rauschunterdrückung zu stark: `denoise_db` senken oder `"denoise": "none"`. |
-| Rendern dauert sehr lange | `"vcodec": "hevc_videotoolbox"` oder `"preset": "fast"` setzen, ggf. 720p. |
+| Rendern dauert sehr lange | In der Ausgabe prüfen, ob `Video-Encoder: hevc_videotoolbox` (bzw. ein anderer Hardware-Encoder) steht. Steht dort `x265`, ist in der `config.json` vermutlich noch `"vcodec": "x265"` eingetragen. Zusätzlich hilft 720p (`"width": 1280, "height": 720`). |

@@ -33,6 +33,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -67,7 +70,13 @@ DEFAULT_CONFIG = {
         # "hevc_nvenc" / "hevc_qsv" / "hevc_amf" (Windows: NVIDIA / Intel / AMD, schnell) |
         # "libx264" | "h264_videotoolbox" | "prores" (Proxy, groß, zum Schneiden)
         # crf: null = Standard (x265: 28, x264: 23). Höher = kleiner/schlechter.
-        "vcodec": "x265", "crf": None, "preset": "medium", "bitrate": "3M",
+        # "auto" = schnellster funktionierender Hardware-Encoder (Mac: hevc_videotoolbox,
+        #          Windows: hevc_nvenc/qsv/amf), sonst x265
+        "vcodec": "auto", "crf": None, "preset": "fast", "bitrate": "3M",
+        # Quellen per Hardware decodieren ("auto" = ffmpeg wählt, fällt sonst auf Software zurück; "none" = aus)
+        "hwaccel": "auto",
+        # Segmente gleichzeitig rendern ("auto" = 3 bei Hardware-Encoder, 1 bei x265)
+        "jobs": "auto",
         "audio_rate": 48000,
         # Endgültige Tonspuren: "aac" (klein) oder "pcm" (verlustfrei, sehr groß)
         "audio_codec": "aac", "aac_mono": "96k", "aac_stereo": "160k", "aac_single": "384k",
@@ -657,6 +666,28 @@ def fine_sync(clips, ref_wavs, scfg):
 
 
 # --------------------------------------------------------------------------- video
+HW_CANDIDATES = ["hevc_videotoolbox", "hevc_nvenc", "hevc_qsv", "hevc_amf"]
+
+
+def encoder_works(name):
+    """Kurzer Probelauf – ein Encoder kann gelistet sein, ohne dass die Hardware da ist."""
+    r = subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=640x360:r=25:d=0.4",
+                        "-c:v", name, "-b:v", "1M", "-pix_fmt", "yuv420p", "-f", "null", "-"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return r.returncode == 0
+
+
+def resolve_encoder(o):
+    v = o["vcodec"]
+    if v != "auto":
+        return v
+    enc = run(["ffmpeg", "-hide_banner", "-encoders"]).decode(errors="replace")
+    for name in HW_CANDIDATES:
+        if f" {name} " in enc and encoder_works(name):
+            return name
+    return "x265"
+
+
 def vcodec_args(o):
     v = o["vcodec"]
     if v == "x265":   # klein bei guter Qualität (Standard)
@@ -680,13 +711,17 @@ class SegmentRenderer:
         self.markers = list(markers)
         self.font = cfg["text"]["fontfile"] or next((f for f in FONT_CANDIDATES if Path(f).exists()), None)
         self.n_txt = 0
+        self.lock = threading.Lock()
+        hw = cfg["output"].get("hwaccel", "auto")
+        self.hw = [] if not hw or hw == "none" else ["-hwaccel", hw]
 
     def text(self, content, size, x, y, expand=False):
         """drawtext über Textdatei (keine Escaping-Probleme). expand=True für %{pts...}."""
         if not self.use_text:
             return ""
-        self.n_txt += 1
-        tf = self.tmp / f"txt_{self.n_txt}.txt"
+        with self.lock:
+            self.n_txt += 1
+            tf = self.tmp / f"txt_{self.n_txt}.txt"
         tf.write_text(content, encoding="utf-8")
         opts = [f"textfile={filter_quote(tf)}", f"expansion={'normal' if expand else 'none'}",
                 "fontcolor=white", f"fontsize={size}", "box=1", "boxcolor=black@0.6",
@@ -722,7 +757,7 @@ class SegmentRenderer:
         else:
             fit = (f"fps={fps},scale={W}:{H}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
                    f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,tpad=stop_mode=clone:stop_duration=2")
-            cmd += ["-ss", f"{max(0.0, main.local(t)):.4f}", "-i", main.path]
+            cmd += [*self.hw, "-ss", f"{max(0.0, main.local(t)):.4f}", "-i", main.path]
             graph = f"[0:v]{fit}"
             # Kamera-Dateiname + Position im Clip unten links
             texts = (self.text(main.path.name, fs, mg, f"h-th-{mg}-{int(fs * 1.6)}")
@@ -731,7 +766,7 @@ class SegmentRenderer:
                 pw = int(W * cfg["pip"]["width_fraction"]) // 2 * 2
                 pm = int(cfg["pip"]["margin"] * k)
                 ps = max(10, int(fs * 0.6))
-                cmd += ["-ss", f"{max(0.0, pip.local(t)):.4f}", "-i", pip.path]
+                cmd += [*self.hw, "-ss", f"{max(0.0, pip.local(t)):.4f}", "-i", pip.path]
                 graph += (f"[m];[1:v]fps={fps},scale={pw}:-2,setsar=1,tpad=stop_mode=clone:stop_duration=2"
                           + self.text(pip.path.name, ps, 8, 8)
                           + self.text(self.tc(pip.local(t)), ps, 8, int(8 + ps * 1.6), expand=True)
@@ -959,16 +994,49 @@ def main():
         total_f = int(round(total * fps))
         segs = build_segments(clips["sony"], clips["gopro"], clips["lav_interviewer"],
                               clips["lav_befragter"], total_f, fps)
+        enc = resolve_encoder(cfg["output"])
+        cfg["output"]["vcodec"] = enc
+        jobs = cfg["output"].get("jobs", "auto")
+        if jobs == "auto":
+            jobs = 1 if enc in ("x265", "libx264", "prores") else 3
+        jobs = max(1, int(jobs))
+        hw = cfg["output"].get("hwaccel", "auto")
+        print(f"Video-Encoder: {enc}  |  Decoding: {'Software' if not hw or hw == 'none' else 'Hardware (' + hw + ')'}"
+              f"  |  parallel: {jobs}")
+
         r = SegmentRenderer(cfg, tmp, use_text, markers)
         listfile = tmp / "segments.txt"
-        with listfile.open("w") as lf:
-            for i, (a, b, main, pip, lavs) in enumerate(segs, 1):
+        seg_files = [tmp / f"seg_{i:05d}.mov" for i in range(1, len(segs) + 1)]
+        total_frames = sum(b - a for a, b, *_ in segs)
+        done = {"frames": 0, "n": 0}
+        t_start = time.time()
+        plock = threading.Lock()
+
+        def work(i):
+            a, b, main, pip, lavs = segs[i]
+            r.render(seg_files[i], a, b, main, pip, lavs)
+            with plock:
+                done["frames"] += b - a
+                done["n"] += 1
+                el = time.time() - t_start
+                frac = done["frames"] / max(total_frames, 1)
+                eta = el / frac - el if frac > 0 else 0
                 name = main.path.name if main else "schwarz"
                 if pip:
                     name += f" + PiP {pip.path.name}"
-                print(f"  Segment {i}/{len(segs)}  {hms(a / fps)} – {hms(b / fps)}  {name}")
-                seg = tmp / f"seg_{i:05d}.mov"
-                r.render(seg, a, b, main, pip, lavs)
+                print(f"  [{frac * 100:5.1f}%] Segment {i + 1}/{len(segs)}  {hms(a / fps)} – {hms(b / fps)}  {name}"
+                      f"   (Tempo {(done['frames'] / fps) / max(el, 1e-6):.1f}x, Rest ca. {hms(eta, False)})")
+
+        if jobs == 1:
+            for i in range(len(segs)):
+                work(i)
+        else:
+            with ThreadPoolExecutor(max_workers=jobs) as ex:
+                for f in [ex.submit(work, i) for i in range(len(segs))]:
+                    f.result()
+        print(f"  Video gerendert in {hms(time.time() - t_start, False)}")
+        with listfile.open("w") as lf:
+            for seg in seg_files:
                 lf.write(f"file '{seg.as_posix().replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n")
 
         print("Füge zusammen ...")
