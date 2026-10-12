@@ -174,11 +174,26 @@ python3 interview_merge.py /pfad/projekt    # anderes Projekt
 | `--raw-audio` | Ton **nicht** aufbereiten, Originalpegel behalten. |
 | `-n NAME`, `--name NAME` | Dateiname des Videos, z.B. `-n interview_kim`. Endung `.mov` wird ergänzt, falls sie fehlt. Der Report heißt dann `interview_kim_report.txt`. Standard: `output.file` aus der Config. |
 | `-o PFAD`, `--output PFAD` | Ausgabeordner für Video, Report und Zwischendateien. Wird angelegt, falls er fehlt. Standard: Projektordner. |
+| `--fresh` | Zwischenstand eines abgebrochenen Laufs ignorieren und komplett neu rendern. |
 | `--keep-temp` | Zwischendateien (WAVs, Segmente) nicht löschen, zur Fehlersuche. |
 
 **Empfohlener Ablauf:** Erst `--dry-run` und prüfen, ob die Uhrzeiten grob plausibel sind. Danach richtig rendern.
 
 ---
+
+## Abbrechen und Fortsetzen
+
+Jeder Lauf arbeitet in einem festen Ordner `imerge_<Name des Videos>` im Ausgabeordner. Wird der Lauf unterbrochen (Strg+C, Terminal geschlossen, Ruhezustand, Platte getrennt), bleibt dieser Ordner liegen. **Denselben Befehl nochmal starten** genügt: Bereits fertige Segmente werden übernommen, nur der Rest wird gerendert.
+
+```
+Fortsetzen: 87/200 Segmente schon fertig (41%), rendere die restlichen 113
+```
+
+- Jedes Segment hat einen Fingerabdruck aus Zeitbereich, Quellclips, Positionen, Einblendungen und Encoder-Einstellungen. Hat sich etwas geändert (andere Config, anderer Sync), wird das betroffene Segment neu gerendert, der Rest bleibt.
+- Halb geschriebene Segmente (`.part.mov`) werden nie übernommen.
+- Ton-Analyse, Sync und Tonaufbereitung laufen bei jedem Start neu; das dauert einige Minuten.
+- Nach erfolgreichem Abschluss wird der Arbeitsordner gelöscht.
+- **Abbrüche der Vorversion** (Ordner `imerge_` mit Zufallsnamen) werden ebenfalls erkannt. Weil die alte Version keine Fingerabdrücke gespeichert hat, wird nur ein lückenloser Anfang übernommen, dessen Segmentlängen exakt zum neuen Plan passen. Liefen diese Segmente mit x265 und wären sie weniger als 75 % des Videos, wird stattdessen mit dem schnelleren Hardware-Encoder komplett neu gerendert.
 
 ## Ergebnis
 

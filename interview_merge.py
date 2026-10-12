@@ -27,7 +27,9 @@ Benutzung:
 Voraussetzungen: ffmpeg/ffprobe (mit drawtext), Python 3.9+, numpy (für Sync).
 """
 import argparse
+import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -735,6 +737,21 @@ class SegmentRenderer:
         # laufende Zeit ab offset Sekunden, Format HH:MM:SS.mmm
         return "%{pts:hms:" + f"{max(0.0, offset):.4f}" + "}"
 
+    def signature(self, a, b, main, pip, lavs):
+        """Fingerabdruck eines Segments: alles, was das Bild bestimmt (nicht der Decoder)."""
+        o, cfg, fps = self.o, self.cfg, self.o["fps"]
+        t = a / fps
+        if main is None:
+            m = next((m for m in self.markers if m.pos - 0.1 <= t < m.pos + m.keep), None)
+            black = (f"{m.real_start:%H:%M:%S}-{m.real_end:%H:%M:%S}" if m else "leer")
+        else:
+            black = None
+        clip = lambda c: None if c is None else [str(c.path), round(c.local(t), 3)]
+        data = [4, a, b, clip(main), clip(pip), [clip(l) for l in lavs], black,
+                o["width"], o["height"], fps, vcodec_args(o), cfg["text"], cfg["pip"],
+                cfg["track_names"], self.use_text, self.font]
+        return hashlib.sha1(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
     def render(self, out, a, b, main, pip, lavs):
         o, cfg = self.o, self.cfg
         W, H, fps = o["width"], o["height"], o["fps"]
@@ -859,6 +876,69 @@ def cut_gaps(every, t0, gcfg):
     return markers
 
 
+# --------------------------------------------------------------------------- Fortsetzen
+ENCODER_NAMES = {"libx265": "x265", "libx264": "libx264", "prores_ks": "prores"}
+SOFTWARE_ENCODERS = {"x265", "libx264", "prores"}
+
+
+def probe_segment(path):
+    """Fertiges Segment prüfen (Bildanzahl, Format). None = fehlt oder unvollständig."""
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-count_packets", "-select_streams", "v:0",
+                            "-show_entries", "stream=codec_name,width,height,r_frame_rate,nb_read_packets"
+                            ":stream_tags=encoder", "-of", "json", str(path)],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60)
+        st = json.loads(r.stdout)["streams"][0]
+        num, den = st["r_frame_rate"].split("/")
+        enc = st.get("tags", {}).get("encoder", "").split()
+        enc = enc[-1] if enc else ""
+        return {"frames": int(st["nb_read_packets"]), "w": int(st["width"]), "h": int(st["height"]),
+                "fps": float(num) / float(den or 1), "encoder": ENCODER_NAMES.get(enc, enc)}
+    except Exception:
+        return None
+
+
+def load_manifest(path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_manifest(path, data):
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def find_legacy(out_dir, work, segs, o):
+    """Alte Arbeitsordner (Zufallsname, ohne Fingerabdrücke) nach wiederverwendbaren Segmenten durchsuchen.
+    Übernommen wird nur ein lückenloser Anfang, dessen Segmentlängen exakt zum neuen Plan passen."""
+    best = None
+    for d in out_dir.glob("imerge_*"):
+        if not d.is_dir() or d == work or not re.fullmatch(r"imerge_[a-z0-9_]{8}", d.name):
+            continue
+        files = sorted(d.glob("seg_[0-9][0-9][0-9][0-9][0-9].mov"))
+        if not files:
+            continue
+        newest = max(f.stat().st_mtime for f in d.iterdir())
+        if time.time() - newest < 180:
+            print(f"  ! {d.name} wird gerade noch beschrieben – übersprungen")
+            continue
+        found, enc = [], None
+        for i, (a, b, *_) in enumerate(segs):
+            f = d / f"seg_{i + 1:05d}.mov"
+            info = probe_segment(f) if f.exists() else None
+            if (not info or info["frames"] != b - a or info["w"] != o["width"] or info["h"] != o["height"]
+                    or abs(info["fps"] - o["fps"]) > 0.01 or (enc and info["encoder"] != enc)):
+                break
+            enc = info["encoder"]
+            found.append(f)
+        if found and (best is None or len(found) > len(best[1])):
+            best = (d, found, enc)
+    return best
+
+
 # --------------------------------------------------------------------------- report
 def report(clips, t0, total, markers=()):
     lines = [f"Timeline-Start: {t0:%Y-%m-%d %H:%M:%S}   Länge: {hms(total)}", ""]
@@ -892,6 +972,8 @@ def main():
                     help="Ausgabeordner für Video, Report und Zwischendateien (Standard: Projektordner)")
     ap.add_argument("--no-cut", action="store_true", help="Pausen ohne Bild und Ton NICHT herausschneiden")
     ap.add_argument("--raw-audio", action="store_true", help="Ton NICHT aufbereiten (Originalpegel)")
+    ap.add_argument("--fresh", action="store_true",
+                    help="Zwischenstand eines abgebrochenen Laufs ignorieren und komplett neu rendern")
     args = ap.parse_args()
 
     for tool in ("ffmpeg", "ffprobe"):
@@ -944,7 +1026,11 @@ def main():
             out_name += ".mov"
         report_name = Path(out_name).stem + "_report.txt"
     print(f"Ausgabe: {out_dir / out_name}")
-    tmp = Path(tempfile.mkdtemp(prefix="imerge_", dir=out_dir))
+    # fester Arbeitsordner pro Ausgabedatei -> nach Abbruch kann derselbe Befehl fortsetzen
+    tmp = out_dir / ("imerge_" + re.sub(r"[^\w.-]+", "_", Path(out_name).stem))
+    tmp.mkdir(exist_ok=True)
+    finished = False
+    legacy_used = []
     wavs = {s: tmp / f"{s}.wav" for s in SOURCES}
     try:
         do_sync = cfg["audio_sync"]["enabled"] and not args.no_sync and np is not None
@@ -995,10 +1081,29 @@ def main():
         segs = build_segments(clips["sony"], clips["gopro"], clips["lav_interviewer"],
                               clips["lav_befragter"], total_f, fps)
         enc = resolve_encoder(cfg["output"])
+        total_frames = sum(b - a for a, b, *_ in segs)
+
+        # alte Arbeitsordner der Vorversion (Zufallsname) nach brauchbaren Segmenten durchsuchen
+        legacy = None if args.fresh else find_legacy(out_dir, tmp, segs, cfg["output"])
+        if legacy:
+            ldir, lfiles, lenc = legacy
+            lframes = sum(segs[i][1] - segs[i][0] for i in range(len(lfiles)))
+            frac = lframes / max(total_frames, 1)
+            if lenc != enc and not (lenc in SOFTWARE_ENCODERS and enc not in SOFTWARE_ENCODERS and frac < 0.75):
+                print(f"  Alter Lauf mit {lenc}: übernehme dessen Encoder, damit die Segmente zusammenpassen")
+                enc = lenc
+            if lenc == enc:
+                print(f"Vorheriger Lauf gefunden ({ldir.name}): {len(lfiles)} Segmente "
+                      f"({frac * 100:.0f}%) werden übernommen")
+            else:
+                print(f"Vorheriger Lauf ({ldir.name}, {lenc}) nur zu {frac * 100:.0f}% fertig – "
+                      f"mit {enc} komplett neu zu rendern ist schneller")
+                legacy = None
         cfg["output"]["vcodec"] = enc
+
         jobs = cfg["output"].get("jobs", "auto")
         if jobs == "auto":
-            jobs = 1 if enc in ("x265", "libx264", "prores") else 3
+            jobs = 1 if enc in SOFTWARE_ENCODERS else 3
         jobs = max(1, int(jobs))
         hw = cfg["output"].get("hwaccel", "auto")
         print(f"Video-Encoder: {enc}  |  Decoding: {'Software' if not hw or hw == 'none' else 'Hardware (' + hw + ')'}"
@@ -1006,35 +1111,67 @@ def main():
 
         r = SegmentRenderer(cfg, tmp, use_text, markers)
         listfile = tmp / "segments.txt"
-        seg_files = [tmp / f"seg_{i:05d}.mov" for i in range(1, len(segs) + 1)]
-        total_frames = sum(b - a for a, b, *_ in segs)
-        done = {"frames": 0, "n": 0}
+        mfile = tmp / "segments.json"
+        manifest = {} if args.fresh else load_manifest(mfile)
+        sigs = [r.signature(*sg) for sg in segs]
+        seg_files = [tmp / f"seg_{sg}.mov" for sg in sigs]
+
+        if legacy:
+            ldir, lfiles, _ = legacy
+            for i, f in enumerate(lfiles):
+                os.replace(f, seg_files[i])
+                manifest[sigs[i]] = seg_files[i].name
+            save_manifest(mfile, manifest)
+            legacy_used.append(ldir)
+
+        # was ist schon fertig?
+        todo = []
+        for i, (sg, f) in enumerate(zip(sigs, seg_files)):
+            ok = False
+            if manifest.get(sg) == f.name and f.exists():
+                info = probe_segment(f)
+                ok = info is not None and info["frames"] == segs[i][1] - segs[i][0]
+            if not ok:
+                todo.append(i)
+        reused = len(segs) - len(todo)
+        if reused:
+            done_f = total_frames - sum(segs[i][1] - segs[i][0] for i in todo)
+            print(f"Fortsetzen: {reused}/{len(segs)} Segmente schon fertig "
+                  f"({done_f / max(total_frames, 1) * 100:.0f}%), rendere die restlichen {len(todo)}")
+
+        todo_frames = sum(segs[i][1] - segs[i][0] for i in todo)
+        done = {"frames": 0}
         t_start = time.time()
         plock = threading.Lock()
 
         def work(i):
             a, b, main, pip, lavs = segs[i]
-            r.render(seg_files[i], a, b, main, pip, lavs)
+            part = seg_files[i].with_name(seg_files[i].stem + ".part.mov")
+            r.render(part, a, b, main, pip, lavs)
+            os.replace(part, seg_files[i])
             with plock:
+                manifest[sigs[i]] = seg_files[i].name
+                save_manifest(mfile, manifest)
                 done["frames"] += b - a
-                done["n"] += 1
                 el = time.time() - t_start
-                frac = done["frames"] / max(total_frames, 1)
+                frac = done["frames"] / max(todo_frames, 1)
                 eta = el / frac - el if frac > 0 else 0
+                overall = (total_frames - todo_frames + done["frames"]) / max(total_frames, 1)
                 name = main.path.name if main else "schwarz"
                 if pip:
                     name += f" + PiP {pip.path.name}"
-                print(f"  [{frac * 100:5.1f}%] Segment {i + 1}/{len(segs)}  {hms(a / fps)} – {hms(b / fps)}  {name}"
+                print(f"  [{overall * 100:5.1f}%] Segment {i + 1}/{len(segs)}  {hms(a / fps)} – {hms(b / fps)}  {name}"
                       f"   (Tempo {(done['frames'] / fps) / max(el, 1e-6):.1f}x, Rest ca. {hms(eta, False)})")
 
         if jobs == 1:
-            for i in range(len(segs)):
+            for i in todo:
                 work(i)
         else:
             with ThreadPoolExecutor(max_workers=jobs) as ex:
-                for f in [ex.submit(work, i) for i in range(len(segs))]:
+                for f in [ex.submit(work, i) for i in todo]:
                     f.result()
-        print(f"  Video gerendert in {hms(time.time() - t_start, False)}")
+        if todo:
+            print(f"  Video gerendert in {hms(time.time() - t_start, False)}")
         with listfile.open("w") as lf:
             for seg in seg_files:
                 lf.write(f"file '{seg.as_posix().replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n")
@@ -1083,13 +1220,25 @@ def main():
             for i, s in enumerate(SOURCES):
                 name = cfg["track_names"][s]
                 cmd += [f"-metadata:s:a:{i}", f"title={name}", f"-metadata:s:a:{i}", f"handler_name={name}"]
-        run(cmd + [out])
+        part_out = out.with_name(out.stem + ".part" + out.suffix)
+        run(cmd + [part_out])
+        os.replace(part_out, out)
+        finished = True
         print(f"\nFertig: {out}\nReport: {out_dir / report_name}")
     finally:
         if args.keep_temp:
-            print(f"Temp-Dateien: {tmp}")
-        else:
+            print(f"Arbeitsordner behalten: {tmp}")
+        elif finished:
             shutil.rmtree(tmp, ignore_errors=True)
+            for d in legacy_used:
+                shutil.rmtree(d, ignore_errors=True)
+            rest = [d.name for d in out_dir.glob("imerge_*") if d.is_dir()]
+            if rest:
+                print(f"Hinweis: In {out_dir} liegen noch Zwischenordner anderer bzw. alter Läufe: "
+                      f"{', '.join(rest)}. Wenn dort gerade nichts mehr läuft, kannst du sie löschen.")
+        else:
+            print(f"\nAbgebrochen. Der Zwischenstand bleibt in {tmp}.\n"
+                  f"Zum Fortsetzen einfach denselben Befehl nochmal starten (mit --fresh komplett neu).")
 
 
 if __name__ == "__main__":
