@@ -925,15 +925,26 @@ def find_legacy(out_dir, work, segs, o):
         if time.time() - newest < 180:
             print(f"  ! {d.name} wird gerade noch beschrieben – übersprungen")
             continue
-        found, enc = [], None
+        found, enc, why = [], None, ""
         for i, (a, b, *_) in enumerate(segs):
             f = d / f"seg_{i + 1:05d}.mov"
             info = probe_segment(f) if f.exists() else None
-            if (not info or info["frames"] != b - a or info["w"] != o["width"] or info["h"] != o["height"]
-                    or abs(info["fps"] - o["fps"]) > 0.01 or (enc and info["encoder"] != enc)):
+            if not f.exists():
+                why = f"Segment {i + 1} fehlt"
+            elif not info:
+                why = f"Segment {i + 1} unvollständig"
+            elif info["frames"] != b - a:
+                why = f"Segment {i + 1} hat {info['frames']} statt {b - a} Bilder (anderer Plan/Sync)"
+            elif info["w"] != o["width"] or info["h"] != o["height"] or abs(info["fps"] - o["fps"]) > 0.01:
+                why = f"andere Auflösung/Bildrate ({info['w']}x{info['h']})"
+            elif enc and info["encoder"] != enc:
+                why = f"Segment {i + 1} mit anderem Encoder"
+            if why:
                 break
             enc = info["encoder"]
             found.append(f)
+        print(f"  Alter Zwischenstand {d.name}: {len(files)} Segmentdateien, {len(found)} passend"
+              + (f" – {why}" if why and len(found) < len(files) else ""))
         if found and (best is None or len(found) > len(best[1])):
             best = (d, found, enc)
     return best
@@ -1029,6 +1040,24 @@ def main():
     # fester Arbeitsordner pro Ausgabedatei -> nach Abbruch kann derselbe Befehl fortsetzen
     tmp = out_dir / ("imerge_" + re.sub(r"[^\w.-]+", "_", Path(out_name).stem))
     tmp.mkdir(exist_ok=True)
+    lock = tmp / "läuft.lock"
+    try:
+        age = time.time() - lock.stat().st_mtime
+    except FileNotFoundError:
+        age = None
+    if age is not None and age < 90:
+        sys.exit(f"Für {out_name} läuft bereits ein anderer Durchgang (Sperrdatei {lock}).\n"
+                 f"Warte, bis er fertig ist. Falls sicher keiner mehr läuft: Datei löschen und neu starten.")
+    lock.write_text(f"pid {os.getpid()}\n", encoding="utf-8")
+    stop_beat = threading.Event()
+
+    def heartbeat():                         # Sperre aktuell halten, solange dieser Lauf lebt
+        while not stop_beat.wait(20):
+            try:
+                os.utime(lock)
+            except OSError:
+                pass
+    threading.Thread(target=heartbeat, daemon=True).start()
     finished = False
     legacy_used = []
     wavs = {s: tmp / f"{s}.wav" for s in SOURCES}
@@ -1080,7 +1109,15 @@ def main():
         total_f = int(round(total * fps))
         segs = build_segments(clips["sony"], clips["gopro"], clips["lav_interviewer"],
                               clips["lav_befragter"], total_f, fps)
+        mfile = tmp / "segments.json"
+        manifest = {} if args.fresh else load_manifest(mfile)
+        print(f"Arbeitsordner: {tmp}")
+        want_auto = cfg["output"]["vcodec"] == "auto"
         enc = resolve_encoder(cfg["output"])
+        prev_enc = manifest.get("__encoder__")
+        if want_auto and prev_enc and prev_enc != enc and (prev_enc in SOFTWARE_ENCODERS or encoder_works(prev_enc)):
+            print(f"  Vorheriger Lauf nutzte {prev_enc} – bleibe dabei, damit der Zwischenstand passt")
+            enc = prev_enc
         total_frames = sum(b - a for a, b, *_ in segs)
 
         # alte Arbeitsordner der Vorversion (Zufallsname) nach brauchbaren Segmenten durchsuchen
@@ -1111,8 +1148,6 @@ def main():
 
         r = SegmentRenderer(cfg, tmp, use_text, markers)
         listfile = tmp / "segments.txt"
-        mfile = tmp / "segments.json"
-        manifest = {} if args.fresh else load_manifest(mfile)
         sigs = [r.signature(*sg) for sg in segs]
         seg_files = [tmp / f"seg_{sg}.mov" for sg in sigs]
 
@@ -1124,15 +1159,27 @@ def main():
             save_manifest(mfile, manifest)
             legacy_used.append(ldir)
 
+        manifest["__encoder__"] = enc
         # was ist schon fertig?
-        todo = []
+        saved = {k for k in manifest if not k.startswith("__")}
+        todo, broken = [], 0
         for i, (sg, f) in enumerate(zip(sigs, seg_files)):
             ok = False
             if manifest.get(sg) == f.name and f.exists():
                 info = probe_segment(f)
                 ok = info is not None and info["frames"] == segs[i][1] - segs[i][0]
+                broken += not ok
             if not ok:
                 todo.append(i)
+        if saved:
+            match = len(saved & set(sigs))
+            print(f"  Gespeicherter Zwischenstand: {len(saved)} Segmente, {match} passen zum aktuellen Plan"
+                  + (f", {broken} davon beschädigt" if broken else ""))
+            if match < len(saved):
+                print("  (nicht passende stammen aus einem Lauf mit anderen Einstellungen, anderem Encoder "
+                      "oder anderem Sync-Ergebnis)")
+        elif not legacy:
+            print("  Kein Zwischenstand gefunden – starte von vorne")
         reused = len(segs) - len(todo)
         if reused:
             done_f = total_frames - sum(segs[i][1] - segs[i][0] for i in todo)
@@ -1167,9 +1214,17 @@ def main():
             for i in todo:
                 work(i)
         else:
-            with ThreadPoolExecutor(max_workers=jobs) as ex:
-                for f in [ex.submit(work, i) for i in todo]:
+            ex = ThreadPoolExecutor(max_workers=jobs)
+            futures = [ex.submit(work, i) for i in todo]
+            try:
+                for f in futures:
                     f.result()
+            except BaseException:
+                for f in futures:          # Strg+C oder Fehler: nichts Neues mehr anfangen
+                    f.cancel()
+                ex.shutdown(wait=False)
+                raise
+            ex.shutdown()
         if todo:
             print(f"  Video gerendert in {hms(time.time() - t_start, False)}")
         with listfile.open("w") as lf:
@@ -1226,6 +1281,11 @@ def main():
         finished = True
         print(f"\nFertig: {out}\nReport: {out_dir / report_name}")
     finally:
+        stop_beat.set()
+        try:
+            lock.unlink()
+        except OSError:
+            pass
         if args.keep_temp:
             print(f"Arbeitsordner behalten: {tmp}")
         elif finished:
