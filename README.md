@@ -191,7 +191,7 @@ Fortsetzen: 87/200 Segmente schon fertig (41%), rendere die restlichen 113
 
 - Jedes Segment hat einen Fingerabdruck aus Zeitbereich, Quellclips, Positionen, Einblendungen und Encoder-Einstellungen. Hat sich etwas geändert (andere Config, anderer Sync), wird das betroffene Segment neu gerendert, der Rest bleibt.
 - Halb geschriebene Segmente (`.part.mov`) werden nie übernommen.
-- Ton-Analyse, Sync und Tonaufbereitung laufen bei jedem Start neu; das dauert einige Minuten.
+- Auch Analyse, Sync, Lav- und Kamera-Tonspuren und die Tonaufbereitung werden gespeichert und beim Fortsetzen übernommen, solange Quelldateien (Größe, Änderungsdatum) und die dafür relevanten Einstellungen gleich sind. Ändert sich etwas davon, läuft die Analyse automatisch neu.
 - Nach erfolgreichem Abschluss wird der Arbeitsordner gelöscht.
 - **Abbrüche der Vorversion** (Ordner `imerge_` mit Zufallsnamen) werden ebenfalls erkannt. Weil die alte Version keine Fingerabdrücke gespeichert hat, wird nur ein lückenloser Anfang übernommen, dessen Segmentlängen exakt zum neuen Plan passen. Liefen diese Segmente mit x265 und wären sie weniger als 75 % des Videos, wird stattdessen mit dem schnelleren Hardware-Encoder komplett neu gerendert.
 

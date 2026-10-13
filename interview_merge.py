@@ -950,6 +950,26 @@ def find_legacy(out_dir, work, segs, o):
     return best
 
 
+ANALYSE_VERSION = 1
+
+
+def analyse_key(every, cfg, args):
+    """Fingerabdruck von allem, was Analyse/Sync beeinflusst: Quelldateien + relevante Einstellungen."""
+    files = []
+    for c in sorted(every, key=lambda c: (c.source, str(c.path))):
+        st = c.path.stat()
+        files.append([c.source, str(c.path), st.st_size, int(st.st_mtime)])
+    rel = {k: cfg.get(k) for k in ("timezone", "sources", "join_tolerance_s", "audio_sync", "cut_gaps")}
+    data = [ANALYSE_VERSION, files, rel, cfg["output"]["audio_rate"], bool(args.no_sync), bool(args.no_cut)]
+    return hashlib.sha1(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def save_state(path, state):
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=1, default=str), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 # --------------------------------------------------------------------------- report
 def report(clips, t0, total, markers=()):
     lines = [f"Timeline-Start: {t0:%Y-%m-%d %H:%M:%S}   Länge: {hms(total)}", ""]
@@ -1058,49 +1078,103 @@ def main():
             except OSError:
                 pass
     threading.Thread(target=heartbeat, daemon=True).start()
+    _prev = [k for k in load_manifest(tmp / "segments.json") if not k.startswith("__")]
+    _ana = (tmp / "analyse.json").exists()
+    if (_prev or _ana) and not args.fresh:
+        print(f"Zwischenstand gefunden in {tmp.name}: "
+              + ("Analyse/Sync" if _ana else "")
+              + (", " if _ana and _prev else "")
+              + (f"{len(_prev)} fertige Video-Segmente" if _prev else "")
+              + " – wird übernommen, soweit Quellen und Einstellungen gleich sind")
+    elif not args.fresh and any(re.fullmatch(r"imerge_[a-z0-9_]{8}", d.name) for d in out_dir.glob("imerge_*")):
+        print("Alter Zwischenordner der Vorversion gefunden – wird nach Analyse und Sync geprüft")
     finished = False
     legacy_used = []
     wavs = {s: tmp / f"{s}.wav" for s in SOURCES}
     try:
-        do_sync = cfg["audio_sync"]["enabled"] and not args.no_sync and np is not None
-        l1, l2 = LAV_SOURCES
-        print("Baue Lav-Spuren ...")
-        build_audio_track(clips[l1], total, wavs[l1], cfg["sources"][l1]["channels"], sr)
-        if do_sync and cfg["audio_sync"]["lav_to_lav"] and clips[l1] and clips[l2]:
-            print("Synchronisiere Lav 2 auf Lav 1 ...")
-            fine_sync(clips[l2], [wavs[l1]], cfg["audio_sync"])
-        build_audio_track(clips[l2], total + 5, wavs[l2], cfg["sources"][l2]["channels"], sr)
+        sfile = tmp / "analyse.json"
+        key = analyse_key(every, cfg, args)
+        state = None if args.fresh else load_manifest(sfile)
+        if state and state.get("key") != key:
+            print("  Quelldateien oder Einstellungen haben sich geändert – Analyse läuft neu")
+            state = None
+        cid = lambda c: f"{c.source}|{c.path}"
 
-        cams = clips["sony"] + clips["gopro"]
-        if cfg["audio_sync"]["enabled"] and not args.no_sync and cams:
-            if np is None:
-                print("  ! numpy fehlt – Audio-Sync übersprungen (pip install numpy)")
-            elif not any(clips[s] for s in LAV_SOURCES):
-                print("  ! keine Lavs – Audio-Sync übersprungen")
-            else:
-                print("Synchronisiere Kameraclips über den Ton ...")
-                refine_sync(cams, [wavs[s] for s in LAV_SOURCES if clips[s]], cfg["audio_sync"], total,
-                            [c for s in LAV_SOURCES for c in clips[s]])
-        shift = -min(c.start for c in every)
-        for c in every:
-            c.start += shift
-        t0 -= timedelta(seconds=shift)
-        markers = [] if args.no_cut else cut_gaps(every, t0, cfg["cut_gaps"])
-        total = max(c.end for c in every)
-        if abs(shift) > 1e-3 or markers:
-            if markers:
-                print(f"{len(markers)} Pause(n) ohne Bild und Ton herausgeschnitten.")
-            print("Baue Lav-Spuren an den neuen Positionen ...")
+        def wav_ok(name, path):
+            return state is not None and path.exists() and state.get("wavs", {}).get(name) == path.stat().st_size
+
+        def wav_done(name, path):
+            state.setdefault("wavs", {})[name] = path.stat().st_size
+            save_state(sfile, state)
+
+        if state:
+            print("Analyse und Sync aus dem vorherigen Lauf übernommen (Quellen und Einstellungen unverändert)")
+            for c in every:
+                d = state["clips"][cid(c)]
+                c.start, c.drift, c.sync_note = d["start"], d["drift"], d["note"]
+                c.real_dt = datetime.fromisoformat(d["real"]) if d.get("real") else None
+            t0 = datetime.fromisoformat(state["t0"])
+            total = state["total"]
+            markers = [GapMarker(m["pos"], m["keep"], datetime.fromisoformat(m["rs"]),
+                                 datetime.fromisoformat(m["re"])) for m in state["markers"]]
             for s in LAV_SOURCES:
-                build_audio_track(clips[s], total, wavs[s], cfg["sources"][s]["channels"], sr)
+                if not wav_ok(s, wavs[s]):
+                    print(f"Baue {cfg['track_names'][s]} neu ...")
+                    build_audio_track(clips[s], total, wavs[s], cfg["sources"][s]["channels"], sr)
+                    wav_done(s, wavs[s])
+        else:
+            do_sync = cfg["audio_sync"]["enabled"] and not args.no_sync and np is not None
+            l1, l2 = LAV_SOURCES
+            print("Baue Lav-Spuren ...")
+            build_audio_track(clips[l1], total, wavs[l1], cfg["sources"][l1]["channels"], sr)
+            if do_sync and cfg["audio_sync"]["lav_to_lav"] and clips[l1] and clips[l2]:
+                print("Synchronisiere Lav 2 auf Lav 1 ...")
+                fine_sync(clips[l2], [wavs[l1]], cfg["audio_sync"])
+            build_audio_track(clips[l2], total + 5, wavs[l2], cfg["sources"][l2]["channels"], sr)
+
+            cams = clips["sony"] + clips["gopro"]
+            if cfg["audio_sync"]["enabled"] and not args.no_sync and cams:
+                if np is None:
+                    print("  ! numpy fehlt – Audio-Sync übersprungen (pip install numpy)")
+                elif not any(clips[s] for s in LAV_SOURCES):
+                    print("  ! keine Lavs – Audio-Sync übersprungen")
+                else:
+                    print("Synchronisiere Kameraclips über den Ton ...")
+                    refine_sync(cams, [wavs[s] for s in LAV_SOURCES if clips[s]], cfg["audio_sync"], total,
+                                [c for s in LAV_SOURCES for c in clips[s]])
+            shift = -min(c.start for c in every)
+            for c in every:
+                c.start += shift
+            t0 -= timedelta(seconds=shift)
+            markers = [] if args.no_cut else cut_gaps(every, t0, cfg["cut_gaps"])
+            total = max(c.end for c in every)
+            if abs(shift) > 1e-3 or markers:
+                if markers:
+                    print(f"{len(markers)} Pause(n) ohne Bild und Ton herausgeschnitten.")
+                print("Baue Lav-Spuren an den neuen Positionen ...")
+                for s in LAV_SOURCES:
+                    build_audio_track(clips[s], total, wavs[s], cfg["sources"][s]["channels"], sr)
+            state = {"key": key, "t0": t0.isoformat(), "total": total,
+                     "clips": {cid(c): {"start": c.start, "drift": c.drift, "note": c.sync_note,
+                                        "real": c.real_dt.isoformat() if c.real_dt else None} for c in every},
+                     "markers": [{"pos": m.pos, "keep": m.keep, "rs": m.real_start.isoformat(),
+                                  "re": m.real_end.isoformat()} for m in markers], "wavs": {}}
+            for s in LAV_SOURCES:
+                state["wavs"][s] = wavs[s].stat().st_size if wavs[s].exists() else None
+            save_state(sfile, state)
 
         rep = report(clips, t0, total, markers)
         print("\n" + rep)
         (out_dir / report_name).write_text(rep, encoding="utf-8")
 
-        print("Baue Kamera-Tonspuren ...")
-        for s in VIDEO_SOURCES:
-            build_audio_track(clips[s], total, wavs[s], cfg["sources"][s]["channels"], sr)
+        if all(wav_ok(s, wavs[s]) for s in VIDEO_SOURCES):
+            print("Kamera-Tonspuren aus dem vorherigen Lauf übernommen")
+        else:
+            print("Baue Kamera-Tonspuren ...")
+            for s in VIDEO_SOURCES:
+                if not wav_ok(s, wavs[s]):
+                    build_audio_track(clips[s], total, wavs[s], cfg["sources"][s]["channels"], sr)
+                    wav_done(s, wavs[s])
 
         filters = run(["ffmpeg", "-hide_banner", "-filters"]).decode(errors="replace")
         use_text = " drawtext " in filters
@@ -1179,7 +1253,7 @@ def main():
                 print("  (nicht passende stammen aus einem Lauf mit anderen Einstellungen, anderem Encoder "
                       "oder anderem Sync-Ergebnis)")
         elif not legacy:
-            print("  Kein Zwischenstand gefunden – starte von vorne")
+            print("  Noch keine fertigen Video-Segmente – rendere alle")
         reused = len(segs) - len(todo)
         if reused:
             done_f = total_frames - sum(segs[i][1] - segs[i][0] for i in todo)
@@ -1245,8 +1319,13 @@ def main():
                     if s in pcfg.get("apply_to", SOURCES) and clips[s]:
                         print(f"  {cfg['track_names'][s]} ...")
                         final_wavs[s] = tmp / f"{s}_processed.wav"
+                        pname = f"{s}_processed|{hashlib.sha1(chain.encode()).hexdigest()[:10]}"
+                        if wav_ok(pname, final_wavs[s]):
+                            print("    (aus dem vorherigen Lauf übernommen)")
+                            continue
                         run(["ffmpeg", "-y", "-v", "error", "-i", wavs[s], "-af", chain,
                              "-c:a", "pcm_s24le", "-rf64", "auto", final_wavs[s]])
+                        wav_done(pname, final_wavs[s])
         cmd = ["ffmpeg", "-y", "-v", "error", "-i", video]
         for s in SOURCES:
             cmd += ["-i", final_wavs[s]]
