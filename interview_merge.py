@@ -32,6 +32,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -139,11 +140,20 @@ GOPRO_RE = re.compile(r"^G[HXLSP](\d{2})(\d{4})", re.I)
 
 
 # --------------------------------------------------------------------------- helpers
+ABORT = threading.Event()        # gesetzt bei Strg+C / Fehler: keine neuen Versuche mehr
+
+
+class FFmpegError(SystemExit):
+    def __init__(self, msg, returncode):
+        super().__init__(msg)
+        self.returncode = returncode
+
+
 def run(cmd):
     r = subprocess.run([str(c) for c in cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if r.returncode != 0:
         err = r.stderr.decode(errors="replace")[-3000:]
-        sys.exit(f"\nFehler bei:\n  {' '.join(map(str, cmd))[:1500]}\n\n{err}")
+        raise FFmpegError(f"\nFehler bei:\n  {' '.join(map(str, cmd))[:1500]}\n\n{err}", r.returncode)
     return r.stdout
 
 
@@ -753,6 +763,19 @@ class SegmentRenderer:
         return hashlib.sha1(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
     def render(self, out, a, b, main, pip, lavs):
+        """Mit Hardware-Decoding rendern; schlägt das fehl, automatisch mit Software-Decoding wiederholen."""
+        if self.hw and main is not None:
+            try:
+                return self._render(out, a, b, main, pip, lavs, self.hw)
+            except FFmpegError as e:
+                time.sleep(0.5)                 # Strg+C-Signal kann minimal nach dem ffmpeg-Ende ankommen
+                if ABORT.is_set() or e.returncode < 0:
+                    raise
+                names = main.path.name + (f" / {pip.path.name}" if pip else "")
+                print(f"  ! Hardware-Decoding fehlgeschlagen bei {names} – wiederhole mit Software-Decoding")
+        return self._render(out, a, b, main, pip, lavs, [])
+
+    def _render(self, out, a, b, main, pip, lavs, hw):
         o, cfg = self.o, self.cfg
         W, H, fps = o["width"], o["height"], o["fps"]
         k = H / 1080                       # Textgrößen mit der Auflösung skalieren
@@ -774,7 +797,7 @@ class SegmentRenderer:
         else:
             fit = (f"fps={fps},scale={W}:{H}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
                    f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,tpad=stop_mode=clone:stop_duration=2")
-            cmd += [*self.hw, "-ss", f"{max(0.0, main.local(t)):.4f}", "-i", main.path]
+            cmd += [*hw, "-ss", f"{max(0.0, main.local(t)):.4f}", "-i", main.path]
             graph = f"[0:v]{fit}"
             # Kamera-Dateiname + Position im Clip unten links
             texts = (self.text(main.path.name, fs, mg, f"h-th-{mg}-{int(fs * 1.6)}")
@@ -783,7 +806,7 @@ class SegmentRenderer:
                 pw = int(W * cfg["pip"]["width_fraction"]) // 2 * 2
                 pm = int(cfg["pip"]["margin"] * k)
                 ps = max(10, int(fs * 0.6))
-                cmd += [*self.hw, "-ss", f"{max(0.0, pip.local(t)):.4f}", "-i", pip.path]
+                cmd += [*hw, "-ss", f"{max(0.0, pip.local(t)):.4f}", "-i", pip.path]
                 graph += (f"[m];[1:v]fps={fps},scale={pw}:-2,setsar=1,tpad=stop_mode=clone:stop_duration=2"
                           + self.text(pip.path.name, ps, 8, 8)
                           + self.text(self.tc(pip.local(t)), ps, 8, int(8 + ps * 1.6), expand=True)
@@ -990,7 +1013,16 @@ def report(clips, t0, total, markers=()):
 
 
 # --------------------------------------------------------------------------- main
+def _on_sigint(signum, frame):
+    ABORT.set()                      # Strg+C: ab sofort nichts mehr wiederholen oder neu starten
+    raise KeyboardInterrupt
+
+
 def main():
+    try:
+        signal.signal(signal.SIGINT, _on_sigint)
+    except (ValueError, OSError):
+        pass
     ap = argparse.ArgumentParser(description="Lavs + Sony + GoPro -> ein Interview-Video")
     ap.add_argument("project", type=Path)
     ap.add_argument("--dry-run", action="store_true", help="nur Zeiten erkennen und Timeline ausgeben")
@@ -1294,6 +1326,7 @@ def main():
                 for f in futures:
                     f.result()
             except BaseException:
+                ABORT.set()
                 for f in futures:          # Strg+C oder Fehler: nichts Neues mehr anfangen
                     f.cancel()
                 ex.shutdown(wait=False)
@@ -1381,4 +1414,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)                # Strg+C: Hinweis zum Fortsetzen steht schon da, kein Traceback
