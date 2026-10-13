@@ -119,6 +119,7 @@ DEFAULT_CONFIG = {
     "text": {"fontfile": None, "size": 34},
     "audio_sync": {"enabled": True, "coarse": True, "coarse_min_ratio": 1.5, "coarse_min_overlap_s": 120,
                    "coarse_local_s": 300.0,
+                   "medium": True, "medium_window_s": 300.0, "medium_excerpts": 6, "medium_excerpt_s": 60.0,
                    "search_s": 10.0, "analyze_s": 30.0, "window_step_s": 240.0,
                    "min_confidence": 8.0, "drift_min_span_s": 600.0,
                    "lav_to_lav": True},
@@ -434,6 +435,8 @@ def audio_chain(pcfg):
 
 
 def read_mono(path, start, dur, sr):
+    if dur <= 0.05:
+        return np.zeros(0)
     raw = run(["ffmpeg", "-v", "error", "-ss", f"{max(0.0, start):.3f}", "-t", f"{dur:.3f}", "-i", path,
                "-ac", "1", "-ar", str(sr), "-f", "f32le", "-"])
     return np.frombuffer(raw, dtype=np.float32).astype(np.float64)
@@ -522,12 +525,17 @@ def coarse_offset(clips, lav_clips, lav_wavs, total, scfg):
         return {"off": float(offs[j]), "ratio": float(sc[j]) / max(second, 1e-3),
                 "peak": float(ncc[j]), "ov": float(ov[j])}
 
-    # Top-3-Kandidaten zur Kontrolle ausgeben
+    # Top-Kandidaten zur Kontrolle ausgeben (und für die mittlere Suche merken)
     sc = score.copy()
-    for _ in range(3):
+    cands = []
+    for _ in range(5):
         i = int(np.argmax(sc))
         if not np.isfinite(sc[i]):
             break
+        cands.append(float(offs[i]))
+        if len(cands) > 3:
+            sc[max(0, i - rate * 30):i + rate * 30 + 1] = -np.inf
+            continue
         print(f"       Kandidat {offs[i]:+9.1f}s ({hms(offs[i], False)})  Score {sc[i]:6.1f}  "
               f"Treffer {ncc[i]:.2f}  Überlappung {hms(ov[i], False)}")
         sc[max(0, i - rate * 30):i + rate * 30 + 1] = -np.inf
@@ -539,7 +547,62 @@ def coarse_offset(clips, lav_clips, lav_wavs, total, scfg):
         sc = score.copy()
         sc[np.abs(offs) > W] = -np.inf
         local = pick(sc)
-    return (glob, local) if glob else None
+    return (glob, local, cands) if glob else None
+
+
+def medium_offset(group, lav_wavs, scfg, total, centers):
+    """Wellenform-Vergleich mehrerer 60-s-Ausschnitte der Kamera mit den Lavs.
+    Sucht ±medium_window_s um die aktuelle Position und ±20 s um die Grobsuch-Kandidaten.
+    Ergebnis nur, wenn mehrere Ausschnitte unabhängig auf denselben Versatz kommen."""
+    sr, L = 4000, float(scfg.get("medium_excerpt_s", 60))
+    W = float(scfg.get("medium_window_s", 300))
+    n_ex = int(scfg.get("medium_excerpts", 6))
+    cams = sorted((c for c in group if c.has_audio and c.duration >= 20), key=lambda c: -c.duration)
+    if not cams:
+        return None
+    # Ausschnitte gleichmäßig über das vorhandene Material verteilen
+    tot = sum(c.duration for c in cams)
+    excerpts = []
+    for k in range(n_ex):
+        pos = (k + 0.5) / n_ex * tot
+        for c in cams:
+            if pos < c.duration:
+                l = min(L, c.duration)
+                excerpts.append((c, max(0.0, min(pos, c.duration - l)), l))
+                break
+            pos -= c.duration
+    windows = [(0.0, W)] + [(cd, 20.0) for cd in centers if abs(cd) > W - 20]
+    results = []
+    for c, tau, l in excerpts:
+        sig = np.diff(read_mono(c.path, tau, l, sr))
+        if len(sig) < sr * 10 or np.std(sig) < 1e-6:
+            continue
+        best = None
+        for center, w in windows:
+            T = c.timeline(tau) + center
+            ref_start, ref_end = max(0.0, T - w), min(total, T + l + w)
+            if ref_end - ref_start < l + 1:
+                continue
+            ref = np.diff(read_ref(lav_wavs, ref_start, ref_end - ref_start, sr))
+            if len(ref) <= len(sig):
+                continue
+            k, z = best_match(ref, sig)
+            off = (ref_start + k / sr) - c.timeline(tau)
+            if best is None or z > best[1]:
+                best = (off, z)
+        if best:
+            results.append(best)
+    good = [r for r in results if r[1] >= scfg.get("min_confidence", 8.0)]
+    for off, z in results:
+        print(f"       Ausschnitt: Versatz {off:+8.2f}s  (z={z:.1f}){'' if z >= scfg.get('min_confidence', 8.0) else '  – unsicher'}")
+    if len(good) < 2:
+        return None
+    # größte Gruppe übereinstimmender Ausschnitte (±0,15 s)
+    best_cluster = max(([g for g in good if abs(g[0] - ref[0]) <= 0.15] for ref in good), key=len)
+    need = max(2, (len(results) + 1) // 2)
+    if len(best_cluster) < need:
+        return None
+    return float(np.median([g[0] for g in best_cluster])), len(best_cluster), len(results)
 
 
 def refine_sync(cam_clips, lav_wavs, scfg, total, lav_clips=()):
@@ -556,7 +619,7 @@ def refine_sync(cam_clips, lav_wavs, scfg, total, lav_clips=()):
             if res is None:
                 print(f"  -> {src}: zu wenig Überlappung mit den Lavs")
                 continue
-            glob, local = res
+            glob, local, cands = res
             min_ratio = scfg.get("coarse_min_ratio", 1.5)
             good = lambda r: r is not None and r["ratio"] >= min_ratio and r["peak"] >= 0.15
             print(f"     Global: Versatz {glob['off']:+.1f}s ({hms(glob['off'])}), Treffer {glob['peak']:.2f}, "
@@ -569,6 +632,12 @@ def refine_sync(cam_clips, lav_wavs, scfg, total, lav_clips=()):
                       f"Abstand {local['ratio']:.2f}x, Überlappung {hms(local['ov'], False)}")
                 if good(local):
                     chosen = local
+            if chosen is None and scfg.get("medium", True):
+                print(f"     Grobsuche nicht eindeutig – vergleiche Ausschnitte als Wellenform ...")
+                med = medium_offset(group, lav_wavs, scfg, total, cands)
+                if med:
+                    chosen = {"off": med[0]}
+                    print(f"     Mittlere Suche: Versatz {med[0]:+.2f}s, {med[1]} von {med[2]} Ausschnitten stimmen überein")
             if chosen is None:
                 print(f"  -> {src}: kein eindeutiger Treffer – Zeiten bleiben wie erkannt "
                       f"(ggf. tags_are_utc oder offset_s in config.json prüfen)")
@@ -659,9 +728,15 @@ def fine_sync(clips, ref_wavs, scfg):
         if meas == "done" or meas is None:
             continue
         d = float(np.median(drifts[c.source])) if drifts.get(c.source) else 0.0
+        vals = [m[1] - (d - c.drift) * m[0] for m in meas] if meas else []
+        if len(vals) >= 2 and max(vals) - min(vals) > 0.2:
+            c.drift = d
+            c.sync_note += (f"Fein: Messungen widersprüchlich ({min(vals):+.2f}…{max(vals):+.2f}s) – "
+                            f"keine sichere Messung")
+            continue
         if meas:
             # Start so wählen, dass die Messpunkte mit der Kamera-Drift passen
-            corr = float(np.median([m[1] - (d - c.drift) * m[0] for m in meas]))
+            corr = float(np.median(vals))
             c.start += corr
             c.drift = d
             c.sync_note += f"Fein {corr:+.3f}s ({len(meas)} Messpunkt(e))"
@@ -671,7 +746,7 @@ def fine_sync(clips, ref_wavs, scfg):
             c.sync_note += "Fein: keine sichere Messung"
     # 3) ganz ohne Messung: Median der Kamera
     for c in clips:
-        if c.sync_note.endswith("keine sichere Messung") and offsets.get(c.source):
+        if "keine sichere Messung" in c.sync_note and offsets.get(c.source):
             med = float(np.median(offsets[c.source]))
             c.start += med
             c.sync_note += f" -> Kamera-Median {med:+.3f}s"
@@ -973,7 +1048,7 @@ def find_legacy(out_dir, work, segs, o):
     return best
 
 
-ANALYSE_VERSION = 1
+ANALYSE_VERSION = 2
 
 
 def analyse_key(every, cfg, args):

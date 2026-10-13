@@ -20,6 +20,7 @@ Ergebnis ist eine einzige `.mov`-Datei mit Bild, allen Tonquellen als getrennten
 3. **Über den Ton synchronisieren:**
    - Lav 2 wird auf Lav 1 abgeglichen, über das Übersprechen zwischen den Mikros.
    - **Grobsuche:** Die komplette Aufnahme jeder Kamera wird gegen die kompletten Lavs abgeglichen. Das findet auch Uhrzeitfehler von Minuten oder Stunden, etwa falsche Zeitzone oder eine falsch gestellte Kamera-Uhr.
+   - **Mittlere Suche:** Ist die Grobsuche nicht eindeutig (typisch bei leisem, verrauschtem GoPro-Ton), werden mehrere 60-Sekunden-Ausschnitte als echte Wellenform mit den Lavs verglichen, ±5 Minuten um die Kamera-Uhrzeit und um die Kandidaten der Grobsuche. Übernommen wird nur, wenn mehrere Ausschnitte unabhängig auf denselben Versatz kommen.
    - **Feinsuche:** Jeder Clip wird an mehreren Stellen auf Millisekunden genau abgeglichen. Dabei wird auch die **Drift** gemessen und korrigiert, also dass Geräte-Uhren minimal unterschiedlich schnell laufen.
 4. **Pausen herausschneiden,** in denen weder Bild noch Ton aufgenommen wurde.
 5. **Ton für Transkription aufbereiten:** Hochpass gegen Rumpeln und Brummen, Rauschunterdrückung und dynamische Lautstärkeanpassung, damit leise und laute Sprecher gleich laut sind. Das passiert erst nach dem Sync und beeinflusst ihn nicht.
@@ -275,6 +276,7 @@ C0016.MP4   18:44:31  @ 00:33:50.12  Dauer 01:12:18.24  [Sony-XML]  Grob -50.7s;
 | `Grob -50.7s` | Uhrzeitfehler der ganzen Kamera (hier: Sony-Uhr 51 s vor) |
 | `Fein +0.213s` | Feinkorrektur dieses Clips |
 | `Drift +12 ppm` | Gangabweichung der Kamera-Uhr gegenüber den Lavs. Bis ca. ±100 ppm ist normal. |
+| `Messungen widersprüchlich` | Die Feinsuche hat an mehreren Stellen unterschiedliche Werte gefunden – meist liegt der Clip noch grob daneben. Wird nicht übernommen. |
 | `keine sichere Messung` | Ton nicht eindeutig zuordenbar, z.B. nur Wind oder Stille. Der Clip übernimmt den Mittelwert der anderen Clips derselben Kamera. |
 
 Bei der Grobsuche steht in der Terminalausgabe pro Kamera:
@@ -392,6 +394,10 @@ Aufbereitung der Tonspuren für automatische Transkription. Sie wird nach dem Sy
 | `coarse_min_ratio` | `1.5` | Mindest-Eindeutigkeit der Grobsuche. Niedriger übernimmt mehr, aber riskanter. |
 | `coarse_min_overlap_s` | `120` | Mindestüberlappung zwischen Kamera und Lavs für einen Treffer |
 | `coarse_local_s` | `300` | Ist die globale Suche nicht eindeutig, wird zusätzlich nur in diesem Fenster (±Sekunden) um die Kamera-Uhrzeit gesucht. Setzt voraus, dass Zeitzone und `tags_are_utc` stimmen. `0` = aus. |
+| `medium` | `true` | Mittlere Suche (Wellenform-Vergleich von Ausschnitten), wenn die Grobsuche nicht eindeutig ist |
+| `medium_window_s` | `300` | Suchbereich der mittleren Suche um die Kamera-Uhrzeit (±Sekunden) |
+| `medium_excerpts` | `6` | Anzahl der verglichenen Ausschnitte |
+| `medium_excerpt_s` | `60` | Länge eines Ausschnitts |
 | `search_s` | `10` | Suchbereich der Feinsuche (±Sekunden) |
 | `analyze_s` | `30` | Länge eines Messfensters |
 | `window_step_s` | `240` | Abstand der Messfenster im Clip |
