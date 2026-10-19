@@ -108,13 +108,12 @@ if exist "%_IM_DIR%\config.json" (
 ) else (
     echo   [!]  keine config.json - es gelten die Standardwerte, Zeitzone = Rechner-Zeitzone!
 )
-for %%d in (lav_interviewer lav_befragter sony gopro) do call :chkdir %%d
 
 echo.
 echo Fertig. In diesem Fenster kannst du jetzt starten:
-echo   python interview_merge.py . --dry-run
-echo   python interview_merge.py .
-echo   python interview_merge.py "E:\Porsche\Interview 1" -o "E:\Export" -n "Interview 1"
+echo   python interview_merge.py merge --audio "E:\Interview 1\lav1" --audio "E:\Interview 1\lav2" --video "E:\Interview 1\sony" -o "E:\Export"
+echo   python interview_merge.py sync-to-video --audio "E:\Interview 1\lav1" --video "E:\Interview 1\sony" -o "E:\Export"
+echo   Hilfe: python interview_merge.py -h
 goto :cleanup
 
 rem ---------------------------------------------------------------- Fehler

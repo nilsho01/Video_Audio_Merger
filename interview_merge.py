@@ -1,30 +1,28 @@
 #!/usr/bin/env python3
 """
-interview_merge.py – baut aus Lavs, Sony und GoPro ein durchgehendes Interview-Video.
+interview_merge.py – synchronisiert beliebig viele Tonaufnahmen mit Kameraclips.
 
-Projektordner:
-  projekt/
-    lav_interviewer/   DJI Mic 2 – Interviewer
-    lav_befragter/     DJI Mic 2 – Befragte*r
-    sony/              Sony-Clips (Video + Ton, ggf. mit ...M01.XML)
-    gopro/             GoPro-Clips (Video + Ton; .LRV/.THM werden ignoriert)
-    config.json        optional, überschreibt DEFAULT_CONFIG
+Drei Modi:
 
-Ergebnis: eine MOV mit 1 Videospur + 4 getrennten Audiospuren
-  Ton: 1 Spur mit 4 Kanälen: Ch1 Lav Interviewer | Ch2 Lav Befragter | Ch3 Sony | Ch4 GoPro
-  Video standardmäßig H.265 (klein bei guter Qualität)
+  merge          Alles in EIN durchgehendes Video: Hauptkamera vollformatig, optional eine
+                 zweite Kamera als Bild-im-Bild, schwarz wo keine Kamera lief.
+  sync-to-audio  Wie merge, aber mit genau einer Kamera (kein Bild-im-Bild).
+  sync-to-video  Pro Kameraclip eine eigene Datei mit allen dazu synchronen Tonspuren.
+                 Nur Zeiten mit Bild, kein Schwarzbild.
 
-Bild: Sony vollformatig; GoPro vollformatig, wenn nur GoPro läuft;
-      laufen beide, GoPro als Bild-im-Bild unten rechts; sonst schwarz.
-      Einblendungen: Gesamt-Timecode oben mittig, Lav 1 oben links und Lav 2 oben rechts
-      (Datei + Position), Kameradatei + Position unten links, GoPro-Name im Bild-im-Bild.
+Beispiele:
+  python3 interview_merge.py merge --audio lav1 --audio lav2 --video sony --pip gopro -o export -n Interview
+  python3 interview_merge.py sync-to-audio --audio lav1 --audio lav2 --video sony -o export
+  python3 interview_merge.py sync-to-video --audio Interviewer=lav1 --audio Gast=lav2 --video sony -o export
 
-Benutzung:
-  python3 interview_merge.py /pfad/projekt --dry-run   # nur Timeline prüfen
-  python3 interview_merge.py /pfad/projekt              # rendern
-  python3 interview_merge.py /pfad/projekt --no-sync    # ohne Audio-Feinsync
+Optionen:
+  --info                 Dateinamen und Timecodes einblenden
+  --only_new_audio       Kameraton weglassen (wird intern trotzdem zum Synchronisieren genutzt)
+  --full_quality_video   Originalauflösung/-bildrate; sync-to-video ohne --info kopiert das Bild unverändert
+  --full_quality_audio   Ton unbearbeitet als PCM (keine Rauschunterdrückung/Lautstärkeanpassung)
+  -o / -n / --fresh / --dry-run / --config
 
-Voraussetzungen: ffmpeg/ffprobe (mit drawtext), Python 3.9+, numpy (für Sync).
+Voraussetzungen: ffmpeg/ffprobe (mit drawtext für --info), Python 3.9+, numpy (für Sync).
 """
 import argparse
 import hashlib
@@ -35,11 +33,10 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -53,76 +50,48 @@ try:
 except ImportError:
     np = None
 
-SOURCES = ["lav_interviewer", "lav_befragter", "sony", "gopro"]
-LAV_SOURCES = ["lav_interviewer", "lav_befragter"]
-VIDEO_SOURCES = ["sony", "gopro"]
+MODES = ("merge", "sync-to-audio", "sync-to-video")
 
 DEFAULT_CONFIG = {
-    "folders": {s: s for s in SOURCES},
-    "track_names": {
-        "lav_interviewer": "Lav Interviewer",
-        "lav_befragter": "Lav Befragter",
-        "sony": "Sony Kamera-Ton",
-        "gopro": "GoPro-Ton",
+    # Zeitzone, in der die Geräte-Uhren laufen, z.B. "Europe/Berlin".
+    # Zeitstempel mit Zonenangabe (Sony-XML, UTC-Tags) werden in diese Zone umgerechnet.
+    "timezone": None,
+    # Standardwerte pro Quellart; einzelne Ordner lassen sich unter "sources" überschreiben
+    # offset_s: manuelle Korrektur in Sekunden; tags_are_utc: creation_time ist echte UTC
+    "defaults": {
+        "audio": {"offset_s": 0.0, "tags_are_utc": True},
+        "video": {"offset_s": 0.0, "tags_are_utc": True, "use_timecode": False},
     },
+    # Überschreibungen pro Ordner, Schlüssel = Anzeigename (Ordnername oder NAME= aus dem Aufruf)
+    "sources": {},
     "output": {
-        "file": "interview_merged.mov",
-        "dir": None,   # Ausgabeordner (null = Projektordner); --output überschreibt das
         "width": 1920, "height": 1080, "fps": 25,
-        # "x265" (klein, Standard) | "hevc_videotoolbox" (Mac, schnell) |
-        # "hevc_nvenc" / "hevc_qsv" / "hevc_amf" (Windows: NVIDIA / Intel / AMD, schnell) |
-        # "libx264" | "h264_videotoolbox" | "prores" (Proxy, groß, zum Schneiden)
-        # crf: null = Standard (x265: 28, x264: 23). Höher = kleiner/schlechter.
-        # "auto" = schnellster funktionierender Hardware-Encoder (Mac: hevc_videotoolbox,
-        #          Windows: hevc_nvenc/qsv/amf), sonst x265
+        # "auto" = schnellster funktionierender Hardware-Encoder, sonst x265
         "vcodec": "auto", "crf": None, "preset": "fast", "bitrate": "3M",
-        # Quellen per Hardware decodieren ("auto" = ffmpeg wählt, fällt sonst auf Software zurück; "none" = aus)
         "hwaccel": "auto",
-        # Segmente gleichzeitig rendern ("auto" = 3 bei Hardware-Encoder, 1 bei x265)
         "jobs": "auto",
         "audio_rate": 48000,
-        # Endgültige Tonspuren: "aac" (klein) oder "pcm" (verlustfrei, sehr groß)
-        "audio_codec": "aac", "aac_mono": "96k", "aac_stereo": "160k", "aac_single": "384k",
-        # "single": eine Tonspur mit 4 Kanälen (Resolve-sicher) | "separate": 4 einzelne Spuren
+        "aac_per_channel": "96k",
+        # "single": eine Tonspur mit allen Kanälen (Resolve-sicher) | "separate": einzelne Spuren
         "audio_tracks": "single",
     },
-    # offset_s: manuelle Korrektur in Sekunden (z.B. Kamera-Uhr 3 s vor -> -3)
-    # tags_are_utc: creation_time-Tag ist echte UTC (Sony) oder nur lokale Zeit mit "Z" (GoPro)
-    "sources": {
-        "lav_interviewer": {"offset_s": 0.0, "tags_are_utc": True, "channels": "mono"},
-        "lav_befragter": {"offset_s": 0.0, "tags_are_utc": True, "channels": "mono"},
-        "sony": {"offset_s": 0.0, "tags_are_utc": True, "channels": "mono", "use_timecode": False},
-        "gopro": {"offset_s": 0.0, "tags_are_utc": True, "channels": "mono"},
-    },
-    # Zeitzone, in der die Geräte-Uhren (DJI, GoPro) laufen, z.B. "Europe/Berlin".
-    # Zeitstempel mit Zonenangabe (Sony-XML, UTC-Tags) werden in diese Zone umgerechnet.
-    # null = Zeitzone des Rechners (falsch, wenn der Rechner woanders steht als die Kameras!)
-    "timezone": None,
-    # Lav-Dateien, deren Start so nah am Ende der vorherigen liegt, werden lückenlos angehängt
+    # Audio-Dateien, deren Start so nah am Ende der vorherigen liegt, werden lückenlos angehängt
     "join_tolerance_s": 3.0,
-    # Pausen, in denen weder Bild noch Ton aufgenommen wurde, herausschneiden.
-    # keep_s Sekunden Schwarzbild bleiben mit Hinweis (Uhrzeit, Länge) stehen.
+    # merge/sync-to-audio: Pausen ohne Bild und Ton herausschneiden
     "cut_gaps": {"enabled": True, "min_gap_s": 10.0, "keep_s": 2.0},
-    # Aufbereitung der Tonspuren für automatische Transkription (nach dem Sync)
+    # Tonaufbereitung für Transkription (aus bei --full_quality_audio)
     "audio_processing": {
-        "enabled": True,
-        "apply_to": ["lav_interviewer", "lav_befragter", "sony", "gopro"],
-        "highpass_hz": 90,          # Rumpeln/Wind/Netzbrummen unter der Stimme entfernen (0 = aus)
-        "denoise": "afftdn",        # "afftdn" | "rnnoise" (braucht rnnoise_model) | "none"
-        "denoise_db": 12,           # Stärke afftdn in dB (6 = leicht, 12 = mittel, 20 = stark)
-        "rnnoise_model": None,      # Pfad zu einer .rnnn-Modelldatei für "rnnoise"
-        "normalize": True,          # dynamische Lautstärkeanpassung
-        "max_gain_db": 20,          # maximale Anhebung leiser Stellen
-        "target_rms": 0.12,         # Ziel-Lautheit (RMS, 0.12 ≈ -18 dBFS)
+        "enabled": True, "highpass_hz": 90, "denoise": "afftdn", "denoise_db": 12,
+        "rnnoise_model": None, "normalize": True, "max_gain_db": 20, "target_rms": 0.12,
     },
     "pip": {"width_fraction": 0.3, "margin": 40},
     "text": {"fontfile": None, "size": 34},
-    "audio_sync": {"enabled": True, "coarse": True, "coarse_min_ratio": 1.5, "coarse_min_overlap_s": 120,
+    "audio_sync": {"enabled": True, "audio_to_audio": True,
+                   "coarse": True, "coarse_min_ratio": 1.5, "coarse_min_overlap_s": 120,
                    "coarse_local_s": 300.0,
                    "medium": True, "medium_window_s": 300.0, "medium_excerpts": 6, "medium_excerpt_s": 60.0,
                    "search_s": 10.0, "analyze_s": 30.0, "window_step_s": 240.0,
-                   "min_confidence": 8.0, "drift_min_span_s": 600.0,
-                   "lav_to_lav": True},
+                   "min_confidence": 8.0, "drift_min_span_s": 600.0},
 }
 
 AUDIO_EXT = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".aif", ".aiff"}
@@ -183,14 +152,34 @@ def hms(sec, frac=True):
 
 
 def filter_quote(path):
-    """Pfad sicher in einen ffmpeg-Filter einsetzen (auch C:/..., Leerzeichen, Apostrophe).
-    Zwei Ebenen: Filter-Optionen (\\ ' : escapen), dann Filtergraph (in '...' einpacken)."""
+    """Pfad sicher in einen ffmpeg-Filter einsetzen (auch C:/..., Leerzeichen, Apostrophe)."""
     p = str(path).replace("\\", "/")
     p = p.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
     return "'" + p.replace("'", "'\\''") + "'"
 
 
-# --------------------------------------------------------------------------- clips
+def safe_name(s):
+    return re.sub(r"[^\w.-]+", "_", s).strip("_") or "x"
+
+
+def concat_line(p):
+    return f"file '{Path(p).as_posix().replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n"
+
+
+# --------------------------------------------------------------------------- Quellen + Clips
+@dataclass
+class Source:
+    key: str        # eindeutiger Kurzname (Dateinamen, Cache)
+    name: str       # Anzeigename (Tonspur, Einblendung, Report)
+    kind: str       # "audio" | "video" | "pip"
+    path: Path
+    cfg: dict = field(default_factory=dict)
+
+    @property
+    def is_video(self):
+        return self.kind in ("video", "pip")
+
+
 @dataclass
 class Clip:
     path: Path
@@ -200,6 +189,10 @@ class Clip:
     duration: float
     has_video: bool
     has_audio: bool
+    width: int = 0
+    height: int = 0
+    fps_str: str = ""
+    channels: int = 1
     start: float = 0.0        # Sekunden ab Timeline-Beginn
     sync_note: str = ""
     drift: float = 0.0        # Gangabweichung der Geräte-Uhr (0.00002 = 20 ppm)
@@ -232,6 +225,36 @@ class Clip:
         return self.start_dt + timedelta(seconds=self.duration)
 
 
+def parse_sources(args, cfg):
+    """--audio/--video/--pip in Source-Objekte übersetzen. Erlaubt 'Name=Pfad'."""
+    out, keys = [], set()
+
+    def add(arg, kind):
+        name = None
+        if "=" in arg and not Path(arg).expanduser().exists():
+            name, arg = arg.split("=", 1)
+        p = Path(arg).expanduser()
+        if not p.exists():
+            sys.exit(f"Nicht gefunden: {p}")
+        p = p.resolve()
+        name = name or (p.name if p.is_dir() else p.stem)
+        key = safe_name(name)
+        while key in keys:
+            key += "_2"
+        keys.add(key)
+        base = cfg["defaults"]["audio" if kind == "audio" else "video"]
+        scfg = deep_merge(base, cfg["sources"].get(name, cfg["sources"].get(key, {})))
+        out.append(Source(key, name, kind, p, scfg))
+
+    for a in args.audio or []:
+        add(a, "audio")
+    if args.video:
+        add(args.video, "video")
+    if args.pip:
+        add(args.pip, "pip")
+    return out
+
+
 def probe(path):
     return json.loads(run(["ffprobe", "-v", "error", "-print_format", "json",
                            "-show_format", "-show_streams", path]))
@@ -261,7 +284,7 @@ def detect_start(path, info, scfg, duration):
             if m:
                 d = parse_iso(m.group(1))
                 dt = to_wall(d) if d.tzinfo else d
-                method = f"Sony-XML"
+                method = "Sony-XML"
                 break
 
     # 2) Broadcast-WAV (bext) – typisch für Audiorecorder
@@ -315,46 +338,51 @@ def detect_start(path, info, scfg, duration):
     return dt, method
 
 
-def load_clips(root, cfg):
-    clips = {s: [] for s in SOURCES}
-    for s in SOURCES:
-        folder = root / cfg["folders"][s]
-        if not folder.is_dir():
-            print(f"  ! Ordner fehlt: {folder} (Spur bleibt stumm/leer)")
-            continue
-        scfg = cfg["sources"][s]
-        for p in sorted(folder.iterdir()):
+def load_clips(sources):
+    clips = {s.key: [] for s in sources}
+    for s in sources:
+        files = [s.path] if s.path.is_file() else sorted(s.path.iterdir())
+        for p in files:
             if p.name.startswith(".") or p.suffix.lower() not in AUDIO_EXT | VIDEO_EXT:
                 continue
             info = probe(p)
             streams = info.get("streams", [])
-            has_v = any(st.get("codec_type") == "video" and not st.get("disposition", {}).get("attached_pic")
-                        for st in streams)
-            has_a = any(st.get("codec_type") == "audio" for st in streams)
-            if s in VIDEO_SOURCES and not has_v:
+            vst = next((st for st in streams if st.get("codec_type") == "video"
+                        and not st.get("disposition", {}).get("attached_pic")), None)
+            ast = next((st for st in streams if st.get("codec_type") == "audio"), None)
+            if s.is_video and not vst:
                 print(f"  ! {p.name}: kein Video, übersprungen")
                 continue
-            dur = None
-            if has_v:
-                dur = next((float(st["duration"]) for st in streams
-                            if st.get("codec_type") == "video" and st.get("duration")), None)
+            if s.kind == "audio" and not ast:
+                print(f"  ! {p.name}: kein Ton, übersprungen")
+                continue
+            dur = float(vst["duration"]) if s.is_video and vst.get("duration") else None
             dur = dur or float(info["format"].get("duration", 0))
             if dur <= 0:
                 print(f"  ! {p.name}: Dauer unbekannt, übersprungen")
                 continue
-            dt, method = detect_start(p, info, scfg, dur)
-            off = float(scfg.get("offset_s", 0))
+            dt, method = detect_start(p, info, s.cfg, dur)
+            off = float(s.cfg.get("offset_s", 0))
             if off:
                 dt += timedelta(seconds=off)
                 method += f", Offset {off:+.2f}s"
-            clips[s].append(Clip(p, s, dt, method, dur, has_v, has_a))
-        clips[s].sort(key=lambda c: c.start_dt)
+            c = Clip(p, s.key, dt, method, dur, s.is_video, ast is not None)
+            if vst:
+                c.width, c.height = int(vst.get("width", 0)), int(vst.get("height", 0))
+                c.fps_str = vst.get("r_frame_rate", "25/1")
+            if ast:
+                c.channels = int(ast.get("channels", 1))
+            clips[s.key].append(c)
+        clips[s.key].sort(key=lambda c: c.start_dt)
+        if not clips[s.key]:
+            print(f"  ! {s.name}: keine passenden Dateien in {s.path}")
     return clips
 
 
-def chain_and_join(clips, tol):
-    for s, lst in clips.items():
-        if s == "gopro":  # GoPro-Kapitel (GX01xxxx, GX02xxxx ...) direkt aneinander
+def chain_and_join(clips, sources, tol):
+    for s in sources:
+        lst = clips[s.key]
+        if s.is_video:   # GoPro-Kapitel (GX01xxxx, GX02xxxx ...) direkt aneinander
             groups = {}
             for c in lst:
                 m = GOPRO_RE.match(c.path.name)
@@ -365,20 +393,18 @@ def chain_and_join(clips, tol):
                 for (_, p), (_, c) in zip(g, g[1:]):
                     c.start_dt, c.method = p.end_dt, f"GoPro-Kapitel nach {p.path.name}"
             lst.sort(key=lambda c: c.start_dt)
-        # automatisch geteilte Aufnahmen (nur DJI Mic 2) lückenlos anhängen –
-        # Kameraclips sind echte Start/Stopps und werden NICHT angehängt
-        if s not in LAV_SOURCES:
             continue
+        # automatisch geteilte Tonaufnahmen (z.B. DJI Mic 2 alle 30 min) lückenlos anhängen
         for prev, cur in zip(lst, lst[1:]):
             gap = (cur.start_dt - prev.end_dt).total_seconds()
-            if abs(gap) <= tol and "Kapitel" not in cur.method:
+            if abs(gap) <= tol:
                 cur.start_dt = prev.end_dt
                 cur.method += f" | angehängt (Lücke war {gap:+.2f}s)"
 
 
 # --------------------------------------------------------------------------- audio
 def build_audio_track(clips, total_s, out, channels, sr, piece_s=120.0):
-    layout = "mono" if channels == "mono" else "stereo"
+    layout = "mono" if channels == 1 else "stereo"
     fmt = f"aformat=sample_fmts=fltp:sample_rates={sr}:channel_layouts={layout}"
     total = int(round(total_s * sr))
     snap = int(0.05 * sr)        # Mini-Lücken zwischen Drift-Abschnitten schließen
@@ -422,14 +448,13 @@ def audio_chain(pcfg):
     d = pcfg.get("denoise", "afftdn")
     if d == "rnnoise":
         model = pcfg.get("rnnoise_model")
-        if not model or not Path(model).exists():
+        if not model or not Path(model).expanduser().exists():
             sys.exit(f"rnnoise_model nicht gefunden: {model}")
         chain.append(f"arnndn=m={filter_quote(Path(model).expanduser())}")
     elif d == "afftdn":
         chain.append(f"afftdn=nr={pcfg.get('denoise_db', 12)}:nf=-45:tn=1")
     if pcfg.get("normalize", True):
         m = 10 ** (float(pcfg.get("max_gain_db", 18)) / 20)
-        # RMS-basiert: gleicht unterschiedlich laute Sprecher deutlich besser an als peak-basiert
         chain.append(f"dynaudnorm=f=250:g=15:p=0.95:m={m:.2f}:r={pcfg.get('target_rms', 0.12)}")
     return ",".join(chain)
 
@@ -442,7 +467,13 @@ def read_mono(path, start, dur, sr):
     return np.frombuffer(raw, dtype=np.float32).astype(np.float64)
 
 
-def best_match(ref, sig, want_ratio=False, guard=100):
+def read_ref(wavs, start, dur, sr):
+    refs = [read_mono(w, start, dur, sr) for w in wavs]
+    L = max(len(r) for r in refs)
+    return sum(np.pad(r, (0, L - len(r))) for r in refs)
+
+
+def best_match(ref, sig):
     """Normierte Kreuzkorrelation: Position von sig in ref + Konfidenz (z-Wert)."""
     sig = sig - sig.mean()
     L = len(sig)
@@ -455,13 +486,7 @@ def best_match(ref, sig, want_ratio=False, guard=100):
     ncc = cc / (np.sqrt(var) * (np.linalg.norm(sig) + 1e-12))
     k = int(np.argmax(ncc))
     z = (ncc[k] - ncc.mean()) / (ncc.std() + 1e-12)
-    if not want_ratio:
-        return k, z
-    # zweitbester Treffer außerhalb von ±guard um den besten
-    masked = ncc.copy()
-    masked[max(0, k - guard):k + guard + 1] = -np.inf
-    second = masked.max() if np.isfinite(masked.max()) else 0.0
-    return k, float(ncc[k]), float(second)
+    return k, z
 
 
 def envelope(x, sr, rate):
@@ -477,18 +502,16 @@ def xcorr_full(a, b):
     return np.concatenate([r[n - (len(b) - 1):], r[:len(a)]])
 
 
-def coarse_offset(clips, lav_clips, lav_wavs, total, scfg):
-    """Gesamte Aufnahme einer Kamera gegen die gesamten Lavs (Lautstärke-Hüllkurve).
+def coarse_offset(clips, ref_clips, ref_wavs, total, scfg):
+    """Gesamte Aufnahme einer Quelle gegen die gesamte Referenz (Lautstärke-Hüllkurve).
     Erlaubt Teil-Überlappung und beliebig große Uhrzeit-Fehler."""
     sr, rate = 2000, 50
-    # Lav-Hüllkurve + Maske (wo überhaupt Lavs laufen)
-    refs = [read_mono(w, 0, total + 60, sr) for w in lav_wavs]
+    refs = [read_mono(w, 0, total + 60, sr) for w in ref_wavs]
     L = max(len(r) for r in refs)
     ref = envelope(sum(np.pad(r, (0, L - len(r))) for r in refs), sr, rate)
     ml = np.zeros(len(ref))
-    for c in lav_clips:
+    for c in ref_clips:
         ml[max(0, int(c.start * rate)):max(0, int(c.end * rate))] = 1
-    # Kamera-Hüllkurve auf eigener Zeitachse, Clips an ihren aktuellen Positionen
     cams = [c for c in clips if c.has_audio]
     if not cams:
         return None
@@ -501,15 +524,15 @@ def coarse_offset(clips, lav_clips, lav_wavs, total, scfg):
         e = e[:len(cam) - i]
         cam[i:i + len(e)], mc[i:i + len(e)] = e, 1
     for x, m in ((ref, ml), (cam, mc)):
-        x[m > 0] -= x[m > 0].mean()
+        if (m > 0).any():
+            x[m > 0] -= x[m > 0].mean()
         x[m == 0] = 0
     num = xcorr_full(ref, cam)
     e_ref = xcorr_full(ref ** 2, mc)
     e_cam = xcorr_full(ml, cam ** 2)
     ov = xcorr_full(ml, mc) / rate
     ncc = num / np.sqrt(np.maximum(e_ref * e_cam, 1e-9))
-    # Signifikanz: Zufallstreffer bei kurzer Überlappung erreichen leicht hohe ncc-Werte,
-    # deshalb mit der Wurzel der Überlappung gewichten (~ z-Wert)
+    # Zufallstreffer bei kurzer Überlappung erreichen leicht hohe ncc-Werte -> mit sqrt(Überlappung) gewichten
     score = ncc * np.sqrt(np.maximum(ov, 0))
     score[ov < scfg.get("coarse_min_overlap_s", 120)] = -np.inf
     offs = (np.arange(len(score)) - (len(cam) - 1)) / rate - c0
@@ -525,7 +548,6 @@ def coarse_offset(clips, lav_clips, lav_wavs, total, scfg):
         return {"off": float(offs[j]), "ratio": float(sc[j]) / max(second, 1e-3),
                 "peak": float(ncc[j]), "ov": float(ov[j])}
 
-    # Top-Kandidaten zur Kontrolle ausgeben (und für die mittlere Suche merken)
     sc = score.copy()
     cands = []
     for _ in range(5):
@@ -533,11 +555,9 @@ def coarse_offset(clips, lav_clips, lav_wavs, total, scfg):
         if not np.isfinite(sc[i]):
             break
         cands.append(float(offs[i]))
-        if len(cands) > 3:
-            sc[max(0, i - rate * 30):i + rate * 30 + 1] = -np.inf
-            continue
-        print(f"       Kandidat {offs[i]:+9.1f}s ({hms(offs[i], False)})  Score {sc[i]:6.1f}  "
-              f"Treffer {ncc[i]:.2f}  Überlappung {hms(ov[i], False)}")
+        if len(cands) <= 3:
+            print(f"       Kandidat {offs[i]:+9.1f}s ({hms(offs[i], False)})  Score {sc[i]:6.1f}  "
+                  f"Treffer {ncc[i]:.2f}  Überlappung {hms(ov[i], False)}")
         sc[max(0, i - rate * 30):i + rate * 30 + 1] = -np.inf
 
     glob = pick(score)
@@ -550,9 +570,8 @@ def coarse_offset(clips, lav_clips, lav_wavs, total, scfg):
     return (glob, local, cands) if glob else None
 
 
-def medium_offset(group, lav_wavs, scfg, total, centers):
-    """Wellenform-Vergleich mehrerer 60-s-Ausschnitte der Kamera mit den Lavs.
-    Sucht ±medium_window_s um die aktuelle Position und ±20 s um die Grobsuch-Kandidaten.
+def medium_offset(group, ref_wavs, scfg, total, centers):
+    """Wellenform-Vergleich mehrerer Ausschnitte mit der Referenz (±medium_window_s und um Kandidaten).
     Ergebnis nur, wenn mehrere Ausschnitte unabhängig auf denselben Versatz kommen."""
     sr, L = 4000, float(scfg.get("medium_excerpt_s", 60))
     W = float(scfg.get("medium_window_s", 300))
@@ -560,7 +579,6 @@ def medium_offset(group, lav_wavs, scfg, total, centers):
     cams = sorted((c for c in group if c.has_audio and c.duration >= 20), key=lambda c: -c.duration)
     if not cams:
         return None
-    # Ausschnitte gleichmäßig über das vorhandene Material verteilen
     tot = sum(c.duration for c in cams)
     excerpts = []
     for k in range(n_ex):
@@ -583,7 +601,7 @@ def medium_offset(group, lav_wavs, scfg, total, centers):
             ref_start, ref_end = max(0.0, T - w), min(total, T + l + w)
             if ref_end - ref_start < l + 1:
                 continue
-            ref = np.diff(read_ref(lav_wavs, ref_start, ref_end - ref_start, sr))
+            ref = np.diff(read_ref(ref_wavs, ref_start, ref_end - ref_start, sr))
             if len(ref) <= len(sig):
                 continue
             k, z = best_match(ref, sig)
@@ -592,32 +610,29 @@ def medium_offset(group, lav_wavs, scfg, total, centers):
                 best = (off, z)
         if best:
             results.append(best)
-    good = [r for r in results if r[1] >= scfg.get("min_confidence", 8.0)]
+    thr = scfg.get("min_confidence", 8.0)
     for off, z in results:
-        print(f"       Ausschnitt: Versatz {off:+8.2f}s  (z={z:.1f}){'' if z >= scfg.get('min_confidence', 8.0) else '  – unsicher'}")
+        print(f"       Ausschnitt: Versatz {off:+8.2f}s  (z={z:.1f}){'' if z >= thr else '  – unsicher'}")
+    good = [r for r in results if r[1] >= thr]
     if len(good) < 2:
         return None
-    # größte Gruppe übereinstimmender Ausschnitte (±0,15 s)
-    best_cluster = max(([g for g in good if abs(g[0] - ref[0]) <= 0.15] for ref in good), key=len)
-    need = max(2, (len(results) + 1) // 2)
-    if len(best_cluster) < need:
+    best_cluster = max(([g for g in good if abs(g[0] - r[0]) <= 0.15] for r in good), key=len)
+    if len(best_cluster) < max(2, (len(results) + 1) // 2):
         return None
     return float(np.median([g[0] for g in best_cluster])), len(best_cluster), len(results)
 
 
-def refine_sync(cam_clips, lav_wavs, scfg, total, lav_clips=()):
-    """Verschiebt Kameraclips so, dass ihr Ton mit den Lavs übereinstimmt."""
+def refine_sync(groups, ref_wavs, ref_clips, scfg, total):
+    """groups: [(Name, Clips)] – jede Gruppe wird als Ganzes grob, dann pro Clip fein synchronisiert."""
     S = float(scfg["search_s"])
-    # 1) Grobsuche: ganze Kamera-Aufnahme gegen ganze Lav-Aufnahme
     if scfg.get("coarse", True):
-        for src in VIDEO_SOURCES:
-            group = [c for c in cam_clips if c.source == src]
+        for name, group in groups:
             if not group:
                 continue
-            print(f"  Grobsuche {src} ...")
-            res = coarse_offset(group, lav_clips, lav_wavs, total, scfg)
+            print(f"  Grobsuche {name} ...")
+            res = coarse_offset(group, ref_clips, ref_wavs, total, scfg)
             if res is None:
-                print(f"  -> {src}: zu wenig Überlappung mit den Lavs")
+                print(f"  -> {name}: zu wenig Überlappung mit der Referenz")
                 continue
             glob, local, cands = res
             min_ratio = scfg.get("coarse_min_ratio", 1.5)
@@ -627,35 +642,28 @@ def refine_sync(cam_clips, lav_wavs, scfg, total, lav_clips=()):
             chosen = glob if good(glob) else None
             if chosen is None and local is not None:
                 W = float(scfg.get("coarse_local_s") or 0)
-                print(f"     Global nicht eindeutig – suche nur ±{hms(W, False)} um die Kamera-Uhrzeit:")
+                print(f"     Global nicht eindeutig – suche nur ±{hms(W, False)} um die Geräte-Uhrzeit:")
                 print(f"     Lokal:  Versatz {local['off']:+.1f}s ({hms(local['off'])}), Treffer {local['peak']:.2f}, "
                       f"Abstand {local['ratio']:.2f}x, Überlappung {hms(local['ov'], False)}")
                 if good(local):
                     chosen = local
             if chosen is None and scfg.get("medium", True):
-                print(f"     Grobsuche nicht eindeutig – vergleiche Ausschnitte als Wellenform ...")
-                med = medium_offset(group, lav_wavs, scfg, total, cands)
+                print("     Grobsuche nicht eindeutig – vergleiche Ausschnitte als Wellenform ...")
+                med = medium_offset(group, ref_wavs, scfg, total, cands)
                 if med:
                     chosen = {"off": med[0]}
                     print(f"     Mittlere Suche: Versatz {med[0]:+.2f}s, {med[1]} von {med[2]} Ausschnitten stimmen überein")
             if chosen is None:
-                print(f"  -> {src}: kein eindeutiger Treffer – Zeiten bleiben wie erkannt "
+                print(f"  -> {name}: kein eindeutiger Treffer – Zeiten bleiben wie erkannt "
                       f"(ggf. tags_are_utc oder offset_s in config.json prüfen)")
             elif abs(chosen["off"]) > S / 2:
-                print(f"  -> {src}: alle Clips um {chosen['off']:+.1f}s verschoben")
+                print(f"  -> {name}: alle Dateien um {chosen['off']:+.1f}s verschoben")
                 for c in group:
                     c.start += chosen["off"]
                     c.sync_note = f"Grob {chosen['off']:+.1f}s; "
             else:
-                print(f"  -> {src}: Uhrzeit passt, Rest macht der Feinsync")
-    # 2) Feinsync über den ganzen Clip inkl. Drift
-    fine_sync(cam_clips, lav_wavs, scfg)
-
-
-def read_ref(wavs, start, dur, sr):
-    refs = [read_mono(w, start, dur, sr) for w in wavs]
-    L = max(len(r) for r in refs)
-    return sum(np.pad(r, (0, L - len(r))) for r in refs)
+                print(f"  -> {name}: Uhrzeit passt, Rest macht der Feinsync")
+    fine_sync([c for _, g in groups for c in g], ref_wavs, scfg)
 
 
 def measure(c, ref_wavs, scfg, sr=8000):
@@ -709,9 +717,8 @@ def fine_sync(clips, ref_wavs, scfg):
             c.sync_note += "kein Ton"
             continue
         results[id(c)] = measure(c, ref_wavs, scfg)
-    # 1) lange Clips: Versatz + Drift fitten
     drifts = {}
-    for c in clips:
+    for c in clips:                                 # lange Clips: Versatz + Drift
         meas = results.get(id(c)) or []
         fit = fit_line(meas) if len(meas) >= 2 else None
         if fit and fit[3] >= min_span:
@@ -721,9 +728,8 @@ def fine_sync(clips, ref_wavs, scfg):
             c.sync_note += f"Fein {a:+.3f}s, Drift {c.drift * 1e6:+.0f} ppm ({n} Messpunkte)"
             drifts.setdefault(c.source, []).append(c.drift)
             results[id(c)] = "done"
-    # 2) kurze Clips: Drift der Kamera übernehmen, nur Versatz messen
     offsets = {}
-    for c in clips:
+    for c in clips:                                 # kurze Clips: Drift der Quelle übernehmen
         meas = results.get(id(c))
         if meas == "done" or meas is None:
             continue
@@ -735,7 +741,6 @@ def fine_sync(clips, ref_wavs, scfg):
                             f"keine sichere Messung")
             continue
         if meas:
-            # Start so wählen, dass die Messpunkte mit der Kamera-Drift passen
             corr = float(np.median(vals))
             c.start += corr
             c.drift = d
@@ -744,16 +749,17 @@ def fine_sync(clips, ref_wavs, scfg):
         else:
             c.drift = d
             c.sync_note += "Fein: keine sichere Messung"
-    # 3) ganz ohne Messung: Median der Kamera
-    for c in clips:
+    for c in clips:                                 # ganz ohne Messung: Median der Quelle
         if "keine sichere Messung" in c.sync_note and offsets.get(c.source):
             med = float(np.median(offsets[c.source]))
             c.start += med
-            c.sync_note += f" -> Kamera-Median {med:+.3f}s"
+            c.sync_note += f" -> Median der Quelle {med:+.3f}s"
 
 
 # --------------------------------------------------------------------------- video
 HW_CANDIDATES = ["hevc_videotoolbox", "hevc_nvenc", "hevc_qsv", "hevc_amf"]
+ENCODER_NAMES = {"libx265": "x265", "libx264": "libx264", "prores_ks": "prores"}
+SOFTWARE_ENCODERS = {"x265", "libx264", "prores"}
 
 
 def encoder_works(name):
@@ -777,14 +783,14 @@ def resolve_encoder(o):
 
 def vcodec_args(o):
     v = o["vcodec"]
-    if v == "x265":   # klein bei guter Qualität (Standard)
+    if v == "x265":
         return ["-c:v", "libx265", "-crf", str(o.get("crf") or 28), "-preset", o["preset"],
                 "-pix_fmt", "yuv420p", "-tag:v", "hvc1", "-x265-params", "log-level=error"]
-    if v == "hevc_videotoolbox":   # Mac-Hardware: viel schneller, etwas größer
+    if v == "hevc_videotoolbox":
         return ["-c:v", "hevc_videotoolbox", "-b:v", o.get("bitrate", "3M"), "-pix_fmt", "yuv420p", "-tag:v", "hvc1"]
     if v == "prores":
         return ["-c:v", "prores_ks", "-profile:v", "0", "-pix_fmt", "yuv422p10le", "-vendor", "apl0"]
-    if v.endswith(("_nvenc", "_qsv", "_amf")):   # Windows/Linux-Hardware: NVIDIA, Intel, AMD
+    if v.endswith(("_nvenc", "_qsv", "_amf")):
         args = ["-c:v", v, "-b:v", o.get("bitrate", "3M"), "-pix_fmt", "yuv420p"]
         return args + (["-tag:v", "hvc1"] if v.startswith("hevc") else [])
     if v == "h264_videotoolbox":
@@ -792,117 +798,151 @@ def vcodec_args(o):
     return ["-c:v", "libx264", "-crf", str(o.get("crf") or 23), "-preset", o["preset"], "-pix_fmt", "yuv420p"]
 
 
-class SegmentRenderer:
-    def __init__(self, cfg, tmp, use_text, markers=()):
-        self.o, self.cfg, self.tmp, self.use_text = cfg["output"], cfg, tmp, use_text
-        self.markers = list(markers)
-        self.font = cfg["text"]["fontfile"] or next((f for f in FONT_CANDIDATES if Path(f).exists()), None)
-        self.n_txt = 0
-        self.lock = threading.Lock()
-        hw = cfg["output"].get("hwaccel", "auto")
-        self.hw = [] if not hw or hw == "none" else ["-hwaccel", hw]
+def fps_value(s):
+    num, _, den = str(s).partition("/")
+    return float(num) / float(den or 1)
 
-    def text(self, content, size, x, y, expand=False):
-        """drawtext über Textdatei (keine Escaping-Probleme). expand=True für %{pts...}."""
-        if not self.use_text:
+
+def full_quality_settings(o, clip):
+    """Originalauflösung/-bildrate der Kamera, hohe Bitrate."""
+    o["width"], o["height"] = clip.width or o["width"], clip.height or o["height"]
+    o["fps_str"] = clip.fps_str or str(o["fps"])
+    o["fps"] = fps_value(o["fps_str"])
+    mbit = max(8, round(o["width"] * o["height"] * o["fps"] * 0.1 / 1e6))
+    o["bitrate"] = f"{mbit}M"
+    o["crf"] = o.get("crf") or 18
+
+
+class Overlay:
+    """drawtext-Einblendungen (nur mit --info)."""
+
+    def __init__(self, cfg, tmp, enabled):
+        self.cfg, self.tmp, self.enabled = cfg, tmp, enabled
+        self.font = cfg["text"]["fontfile"] or next((f for f in FONT_CANDIDATES if Path(f).exists()), None)
+        self.n = 0
+        self.lock = threading.Lock()
+
+    def text(self, content, size, x, y, expand=False, enable=None):
+        if not self.enabled:
             return ""
         with self.lock:
-            self.n_txt += 1
-            tf = self.tmp / f"txt_{self.n_txt}.txt"
+            self.n += 1
+            tf = self.tmp / f"txt_{self.n}.txt"
         tf.write_text(content, encoding="utf-8")
         opts = [f"textfile={filter_quote(tf)}", f"expansion={'normal' if expand else 'none'}",
                 "fontcolor=white", f"fontsize={size}", "box=1", "boxcolor=black@0.6",
                 f"boxborderw={max(4, size // 3)}", f"x={x}", f"y={y}"]
+        if enable:
+            opts.append(f"enable='{enable}'")
         if self.font:
             opts.insert(0, f"fontfile={filter_quote(self.font)}")
         return ",drawtext=" + ":".join(opts)
 
     @staticmethod
     def tc(offset):
-        # laufende Zeit ab offset Sekunden, Format HH:MM:SS.mmm
         return "%{pts:hms:" + f"{max(0.0, offset):.4f}" + "}"
 
-    def signature(self, a, b, main, pip, lavs):
-        """Fingerabdruck eines Segments: alles, was das Bild bestimmt (nicht der Decoder)."""
-        o, cfg, fps = self.o, self.cfg, self.o["fps"]
+    def sizes(self, H):
+        k = H / 1080
+        fs = max(12, int(self.cfg["text"]["size"] * k))
+        return k, fs, max(10, int(fs * 0.8)), max(10, int(40 * k))
+
+    @staticmethod
+    def audio_pos(i, mg, small, W):
+        """Audio-Einblendungen abwechselnd oben links/rechts, weitere Zeilen darunter."""
+        x = str(mg) if i % 2 == 0 else f"w-tw-{mg}"
+        y = int(mg + (i // 2) * small * 3.4)
+        return x, y
+
+
+class SegmentRenderer:
+    """Rendert ein Stück der Timeline (merge / sync-to-audio)."""
+
+    def __init__(self, cfg, tmp, overlay, audio_srcs, markers=()):
+        self.o, self.cfg, self.tmp, self.ov = cfg["output"], cfg, tmp, overlay
+        self.audio_srcs = audio_srcs
+        self.markers = list(markers)
+        hw = self.o.get("hwaccel", "auto")
+        self.hw = [] if not hw or hw == "none" else ["-hwaccel", hw]
+
+    def marker_at(self, t):
+        return next((m for m in self.markers if m.pos - 0.1 <= t < m.pos + m.keep), None)
+
+    def signature(self, a, b, main, pip, auds):
+        o, fps = self.o, self.o["fps"]
         t = a / fps
+        black = None
         if main is None:
-            m = next((m for m in self.markers if m.pos - 0.1 <= t < m.pos + m.keep), None)
-            black = (f"{m.real_start:%H:%M:%S}-{m.real_end:%H:%M:%S}" if m else "leer")
-        else:
-            black = None
+            m = self.marker_at(t)
+            black = f"{m.real_start:%H:%M:%S}-{m.real_end:%H:%M:%S}" if m else "leer"
         clip = lambda c: None if c is None else [str(c.path), round(c.local(t), 3)]
-        data = [4, a, b, clip(main), clip(pip), [clip(l) for l in lavs], black,
-                o["width"], o["height"], fps, vcodec_args(o), cfg["text"], cfg["pip"],
-                cfg["track_names"], self.use_text, self.font]
+        data = [5, a, b, clip(main), clip(pip), [clip(x) for x in auds] if self.ov.enabled else None, black,
+                o["width"], o["height"], o.get("fps_str", fps), vcodec_args(o), self.cfg["pip"],
+                self.ov.enabled, self.cfg["text"] if self.ov.enabled else None,
+                [s.name for s in self.audio_srcs] if self.ov.enabled else None]
         return hashlib.sha1(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
-    def render(self, out, a, b, main, pip, lavs):
-        """Mit Hardware-Decoding rendern; schlägt das fehl, automatisch mit Software-Decoding wiederholen."""
+    def render(self, out, a, b, main, pip, auds):
+        """Mit Hardware-Decoding rendern; schlägt das fehl, mit Software-Decoding wiederholen."""
         if self.hw and main is not None:
             try:
-                return self._render(out, a, b, main, pip, lavs, self.hw)
+                return self._render(out, a, b, main, pip, auds, self.hw)
             except FFmpegError as e:
-                time.sleep(0.5)                 # Strg+C-Signal kann minimal nach dem ffmpeg-Ende ankommen
+                time.sleep(0.5)
                 if ABORT.is_set() or e.returncode < 0:
                     raise
                 names = main.path.name + (f" / {pip.path.name}" if pip else "")
                 print(f"  ! Hardware-Decoding fehlgeschlagen bei {names} – wiederhole mit Software-Decoding")
-        return self._render(out, a, b, main, pip, lavs, [])
+        return self._render(out, a, b, main, pip, auds, [])
 
-    def _render(self, out, a, b, main, pip, lavs, hw):
-        o, cfg = self.o, self.cfg
+    def _render(self, out, a, b, main, pip, auds, hw):
+        o, ov = self.o, self.ov
         W, H, fps = o["width"], o["height"], o["fps"]
-        k = H / 1080                       # Textgrößen mit der Auflösung skalieren
-        fs = max(12, int(cfg["text"]["size"] * k))
-        small = max(10, int(fs * 0.8))
-        mg = max(10, int(40 * k))
+        rate = o.get("fps_str", fps)
+        k, fs, small, mg = ov.sizes(H)
         n, t = b - a, a / fps
         cmd = ["ffmpeg", "-y", "-v", "error"]
         if main is None:
-            cmd += ["-f", "lavfi", "-i", f"color=c=black:s={W}x{H}:r={fps}"]
+            cmd += ["-f", "lavfi", "-i", f"color=c=black:s={W}x{H}:r={rate}"]
             graph = "[0:v]null"
-            m = next((m for m in self.markers if m.pos - 0.1 <= t < m.pos + m.keep), None)
+            m = self.marker_at(t)
             if m:
                 dur = (m.real_end - m.real_start).total_seconds()
-                texts = self.text(f"Pause herausgeschnitten\n{m.real_start:%H:%M:%S} - {m.real_end:%H:%M:%S}"
-                                  f"  ({hms(dur, False)})", fs, "(w-tw)/2", "(h-th)/2")
+                texts = ov.text(f"Pause herausgeschnitten\n{m.real_start:%H:%M:%S} - {m.real_end:%H:%M:%S}"
+                                f"  ({hms(dur, False)})", fs, "(w-tw)/2", "(h-th)/2")
             else:
-                texts = self.text("kein Videomaterial", fs, "(w-tw)/2", "(h-th)/2")
+                texts = ov.text("kein Videomaterial", fs, "(w-tw)/2", "(h-th)/2")
         else:
-            fit = (f"fps={fps},scale={W}:{H}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+            fit = (f"fps={rate},scale={W}:{H}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
                    f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,tpad=stop_mode=clone:stop_duration=2")
             cmd += [*hw, "-ss", f"{max(0.0, main.local(t)):.4f}", "-i", main.path]
             graph = f"[0:v]{fit}"
-            # Kamera-Dateiname + Position im Clip unten links
-            texts = (self.text(main.path.name, fs, mg, f"h-th-{mg}-{int(fs * 1.6)}")
-                     + self.text(self.tc(main.local(t)), fs, mg, f"h-th-{mg}", expand=True))
+            texts = (ov.text(main.path.name, fs, mg, f"h-th-{mg}-{int(fs * 1.6)}")
+                     + ov.text(ov.tc(main.local(t)), fs, mg, f"h-th-{mg}", expand=True))
             if pip is not None:
-                pw = int(W * cfg["pip"]["width_fraction"]) // 2 * 2
-                pm = int(cfg["pip"]["margin"] * k)
+                pw = int(W * self.cfg["pip"]["width_fraction"]) // 2 * 2
+                pm = int(self.cfg["pip"]["margin"] * k)
                 ps = max(10, int(fs * 0.6))
                 cmd += [*hw, "-ss", f"{max(0.0, pip.local(t)):.4f}", "-i", pip.path]
-                graph += (f"[m];[1:v]fps={fps},scale={pw}:-2,setsar=1,tpad=stop_mode=clone:stop_duration=2"
-                          + self.text(pip.path.name, ps, 8, 8)
-                          + self.text(self.tc(pip.local(t)), ps, 8, int(8 + ps * 1.6), expand=True)
+                graph += (f"[m];[1:v]fps={rate},scale={pw}:-2,setsar=1,tpad=stop_mode=clone:stop_duration=2"
+                          + ov.text(pip.path.name, ps, 8, 8)
+                          + ov.text(ov.tc(pip.local(t)), ps, 8, int(8 + ps * 1.6), expand=True)
                           + f"[p];[m][p]overlay=W-w-{pm}:H-h-{pm}")
-        # laufender Timecode des Gesamtvideos oben mittig
-        texts += self.text(self.tc(t), int(fs * 1.3), "(w-tw)/2", mg, expand=True)
-        # Lav 1 oben links, Lav 2 oben rechts: Dateiname + Position in der Datei
-        for lav, src, x in zip(lavs, LAV_SOURCES, (str(mg), f"w-tw-{mg}")):
-            label = cfg["track_names"][src]
-            if lav is None:
-                texts += self.text(f"{label}: -", small, x, mg)
+        texts += ov.text(ov.tc(t), int(fs * 1.3), "(w-tw)/2", mg, expand=True)
+        for i, (src, c) in enumerate(zip(self.audio_srcs, auds)):
+            x, y = ov.audio_pos(i, mg, small, W)
+            if c is None:
+                texts += ov.text(f"{src.name}: -", small, x, y)
             else:
-                texts += self.text(f"{label}: {lav.path.name}", small, x, mg)
-                texts += self.text(self.tc(lav.local(t)), small, x, int(mg + small * 1.6), expand=True)
+                texts += ov.text(f"{src.name}: {c.path.name}", small, x, y)
+                texts += ov.text(ov.tc(c.local(t)), small, x, int(y + small * 1.6), expand=True)
         graph += texts + "[v]"
         cmd += ["-filter_complex", graph, "-map", "[v]", "-frames:v", str(n), "-an",
                 *vcodec_args(o), "-video_track_timescale", "90000", out]
         run(cmd)
 
 
-def build_segments(sony, gopro, lav1, lav2, total_f, fps, piece_s=120.0):
+def build_segments(mains, pips, audio_lists, total_f, fps, piece_s=120.0):
     def frames(c):
         return max(0, round(c.start * fps)), min(total_f, round(c.end * fps))
 
@@ -914,9 +954,9 @@ def build_segments(sony, gopro, lav1, lav2, total_f, fps, piece_s=120.0):
         return None
 
     pts, forced = {0, total_f}, set()
-    for c in sony + gopro + lav1 + lav2:
+    for c in mains + pips + [c for lst in audio_lists for c in lst]:
         pts.update(frames(c))
-    for c in sony + gopro:   # Drift: Video alle piece_s neu ansetzen
+    for c in mains + pips:   # Drift: Video alle piece_s neu ansetzen
         for tau, _ in c.pieces(piece_s)[1:]:
             forced.add(round(c.timeline(tau) * fps))
     pts |= forced
@@ -925,13 +965,13 @@ def build_segments(sony, gopro, lav1, lav2, total_f, fps, piece_s=120.0):
     for a, b in zip(pts, pts[1:]):
         if b <= a:
             continue
-        so, go = active(sony, a), active(gopro, a)
-        main, pip = (so, go) if so else (go, None)
-        lavs = (active(lav1, a), active(lav2, a))
-        if segs and a not in forced and segs[-1][2] is main and segs[-1][3] is pip and segs[-1][4] == lavs:
+        mo, po = active(mains, a), active(pips, a)
+        main, pip = (mo, po) if mo else (po, None)
+        auds = tuple(active(lst, a) for lst in audio_lists)
+        if segs and a not in forced and segs[-1][2] is main and segs[-1][3] is pip and segs[-1][4] == auds:
             segs[-1][1] = b
         else:
-            segs.append([a, b, main, pip, lavs])
+            segs.append([a, b, main, pip, auds])
     return segs
 
 
@@ -939,14 +979,13 @@ def build_segments(sony, gopro, lav1, lav2, total_f, fps, piece_s=120.0):
 @dataclass
 class GapMarker:
     pos: float          # Position in der geschnittenen Timeline
-    keep: float         # davon stehen gelassen (Schwarzbild mit Hinweis)
+    keep: float         # davon stehen gelassen (Schwarzbild)
     real_start: datetime
     real_end: datetime
 
 
 def cut_gaps(every, t0, gcfg):
-    """Entfernt Zeiten, in denen weder Bild noch Ton aufgenommen wurde.
-    Gibt Marker für die verbleibenden kurzen Pausen zurück."""
+    """Entfernt Zeiten, in denen weder Bild noch Ton aufgenommen wurde."""
     for c in every:
         c.real_dt = t0 + timedelta(seconds=c.start)
     if not gcfg.get("enabled", True):
@@ -958,8 +997,7 @@ def cut_gaps(every, t0, gcfg):
         if a - cur_end > min_gap:
             gaps.append((cur_end, a))
         cur_end = max(cur_end, b)
-    markers, removed = [], 0.0
-    cuts = []   # (Lückenende in alter Zeit, kumulativ entfernt)
+    markers, removed, cuts = [], 0.0, []
     for a, b in gaps:
         pos = a - removed
         removed += (b - a) - keep
@@ -974,102 +1012,48 @@ def cut_gaps(every, t0, gcfg):
     return markers
 
 
-# --------------------------------------------------------------------------- Fortsetzen
-ENCODER_NAMES = {"libx265": "x265", "libx264": "libx264", "prores_ks": "prores"}
-SOFTWARE_ENCODERS = {"x265", "libx264", "prores"}
-
-
-def probe_segment(path):
-    """Fertiges Segment prüfen (Bildanzahl, Format). None = fehlt oder unvollständig."""
+# --------------------------------------------------------------------------- Zwischenstand
+def probe_frames(path):
+    """Fertige Videodatei prüfen. None = fehlt oder unvollständig."""
     try:
         r = subprocess.run(["ffprobe", "-v", "error", "-count_packets", "-select_streams", "v:0",
-                            "-show_entries", "stream=codec_name,width,height,r_frame_rate,nb_read_packets"
-                            ":stream_tags=encoder", "-of", "json", str(path)],
-                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60)
-        st = json.loads(r.stdout)["streams"][0]
-        num, den = st["r_frame_rate"].split("/")
-        enc = st.get("tags", {}).get("encoder", "").split()
-        enc = enc[-1] if enc else ""
-        return {"frames": int(st["nb_read_packets"]), "w": int(st["width"]), "h": int(st["height"]),
-                "fps": float(num) / float(den or 1), "encoder": ENCODER_NAMES.get(enc, enc)}
+                            "-show_entries", "stream=nb_read_packets", "-of", "json", str(path)],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=120)
+        return int(json.loads(r.stdout)["streams"][0]["nb_read_packets"])
     except Exception:
         return None
 
 
-def load_manifest(path):
+def load_json(path):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
 
-def save_manifest(path, data):
+def save_json(path, data):
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    tmp.write_text(json.dumps(data, indent=1, default=str), encoding="utf-8")
     os.replace(tmp, path)
 
 
-def find_legacy(out_dir, work, segs, o):
-    """Alte Arbeitsordner (Zufallsname, ohne Fingerabdrücke) nach wiederverwendbaren Segmenten durchsuchen.
-    Übernommen wird nur ein lückenloser Anfang, dessen Segmentlängen exakt zum neuen Plan passen."""
-    best = None
-    for d in out_dir.glob("imerge_*"):
-        if not d.is_dir() or d == work or not re.fullmatch(r"imerge_[a-z0-9_]{8}", d.name):
-            continue
-        files = sorted(d.glob("seg_[0-9][0-9][0-9][0-9][0-9].mov"))
-        if not files:
-            continue
-        newest = max(f.stat().st_mtime for f in d.iterdir())
-        if time.time() - newest < 180:
-            print(f"  ! {d.name} wird gerade noch beschrieben – übersprungen")
-            continue
-        found, enc, why = [], None, ""
-        for i, (a, b, *_) in enumerate(segs):
-            f = d / f"seg_{i + 1:05d}.mov"
-            info = probe_segment(f) if f.exists() else None
-            if not f.exists():
-                why = f"Segment {i + 1} fehlt"
-            elif not info:
-                why = f"Segment {i + 1} unvollständig"
-            elif info["frames"] != b - a:
-                why = f"Segment {i + 1} hat {info['frames']} statt {b - a} Bilder (anderer Plan/Sync)"
-            elif info["w"] != o["width"] or info["h"] != o["height"] or abs(info["fps"] - o["fps"]) > 0.01:
-                why = f"andere Auflösung/Bildrate ({info['w']}x{info['h']})"
-            elif enc and info["encoder"] != enc:
-                why = f"Segment {i + 1} mit anderem Encoder"
-            if why:
-                break
-            enc = info["encoder"]
-            found.append(f)
-        print(f"  Alter Zwischenstand {d.name}: {len(files)} Segmentdateien, {len(found)} passend"
-              + (f" – {why}" if why and len(found) < len(files) else ""))
-        if found and (best is None or len(found) > len(best[1])):
-            best = (d, found, enc)
-    return best
+ANALYSE_VERSION = 3
 
 
-ANALYSE_VERSION = 2
-
-
-def analyse_key(every, cfg, args):
-    """Fingerabdruck von allem, was Analyse/Sync beeinflusst: Quelldateien + relevante Einstellungen."""
+def analyse_key(every, sources, cfg, mode):
     files = []
     for c in sorted(every, key=lambda c: (c.source, str(c.path))):
         st = c.path.stat()
         files.append([c.source, str(c.path), st.st_size, int(st.st_mtime)])
-    rel = {k: cfg.get(k) for k in ("timezone", "sources", "join_tolerance_s", "audio_sync", "cut_gaps")}
-    data = [ANALYSE_VERSION, files, rel, cfg["output"]["audio_rate"], bool(args.no_sync), bool(args.no_cut)]
+    srcs = [[s.key, s.kind, str(s.path), s.cfg] for s in sources]
+    rel = {k: cfg.get(k) for k in ("timezone", "join_tolerance_s", "audio_sync")}
+    cut = cfg["cut_gaps"] if mode != "sync-to-video" else None
+    data = [ANALYSE_VERSION, mode, files, srcs, rel, cut, cfg["output"]["audio_rate"]]
     return hashlib.sha1(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest()
 
 
-def save_state(path, state):
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=1, default=str), encoding="utf-8")
-    os.replace(tmp, path)
-
-
 # --------------------------------------------------------------------------- report
-def report(clips, t0, total, markers=()):
+def report(sources, clips, t0, total, markers=()):
     lines = [f"Timeline-Start: {t0:%Y-%m-%d %H:%M:%S}   Länge: {hms(total)}", ""]
     if markers:
         lines.append(f"== Herausgeschnittene Pausen ({len(markers)})")
@@ -1077,9 +1061,10 @@ def report(clips, t0, total, markers=()):
             dur = (m.real_end - m.real_start).total_seconds()
             lines.append(f"  @ {hms(m.pos)}  {m.real_start:%H:%M:%S} – {m.real_end:%H:%M:%S}  ({hms(dur, False)} entfernt)")
         lines.append("")
-    for s in SOURCES:
-        lines.append(f"== {s} ({len(clips[s])} Dateien)")
-        for c in clips[s]:
+    kinds = {"audio": "Ton", "video": "Kamera", "pip": "Kamera Bild-im-Bild"}
+    for s in sources:
+        lines.append(f"== {s.name} ({kinds[s.kind]}, {len(clips[s.key])} Dateien)")
+        for c in clips[s.key]:
             real = c.real_dt or (t0 + timedelta(seconds=c.start))
             lines.append(f"  {c.path.name:<28} {real:%H:%M:%S}  @ {hms(c.start)}  Dauer {hms(c.duration)}"
                          f"  [{c.method}]" + (f"  {c.sync_note}" if c.sync_note else ""))
@@ -1087,10 +1072,86 @@ def report(clips, t0, total, markers=()):
     return "\n".join(lines)
 
 
-# --------------------------------------------------------------------------- main
+# --------------------------------------------------------------------------- Ton ausgeben
+def channel_labels(names, chans):
+    """Kanalbelegung als Text, z.B. '1 Interviewer | 2 Gast | 3–4 sony (Kamera)'."""
+    out, k = [], 1
+    for nm, ch in zip(names, chans):
+        out.append(f"{k}{'–' + str(k + ch - 1) if ch > 1 else ''} {nm}")
+        k += ch
+    return " | ".join(out)
+
+
+def audio_out_args(n_channels, full_audio, o):
+    if full_audio:
+        return ["-c:a", "pcm_s24le"]
+    rate = int(str(o["aac_per_channel"]).rstrip("k"))
+    return ["-c:a", "aac", "-b:a", f"{min(rate * n_channels, 1024)}k"]
+
+
+def mux_audio_graph(inputs, names, first_idx, o, full_audio, chans=None):
+    """Tonquellen (Eingänge ab first_idx) zu einer Spur mit n Kanälen bzw. n Spuren zusammenfassen."""
+    n = len(inputs)
+    if n == 0:
+        return [], []
+    chans = chans or [1] * n
+    if o["audio_tracks"] == "single":
+        lay = lambda i: ",aformat=channel_layouts=" + ("stereo" if full_audio and chans[i] >= 2 else "mono")
+        graph = ";".join(f"[{first_idx + i}:a]anull{lay(i)}[m{i}]" for i in range(n))
+        if n == 1:
+            graph = graph.replace("[m0]", "[a]")
+        else:
+            graph += ";" + "".join(f"[m{i}]" for i in range(n)) + f"amerge=inputs={n}[a]"
+        title = channel_labels(names, [c if full_audio else 1 for c in chans])
+        return ["-filter_complex", graph, "-map", "[a]", *audio_out_args(n, full_audio, o)], \
+            ["-metadata:s:a:0", f"title={title}"]
+    maps, meta = [], []
+    for i, nm in enumerate(names):
+        maps += ["-map", f"{first_idx + i}:a"]
+        meta += [f"-metadata:s:a:{i}", f"title={nm}", f"-metadata:s:a:{i}", f"handler_name={nm}"]
+    return maps + audio_out_args(1, full_audio, o), meta
+
+
+# --------------------------------------------------------------------------- Hauptprogramm
 def _on_sigint(signum, frame):
-    ABORT.set()                      # Strg+C: ab sofort nichts mehr wiederholen oder neu starten
+    ABORT.set()
     raise KeyboardInterrupt
+
+
+def parse_args():
+    ap = argparse.ArgumentParser(
+        description="Ton- und Kameraaufnahmen automatisch synchronisieren.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Modi:\n"
+               "  merge          ein Video: Hauptkamera + optional Bild-im-Bild (--pip), schwarz ohne Kamera\n"
+               "  sync-to-audio  ein Video aus genau einer Kamera, Zeitachse am Ton\n"
+               "  sync-to-video  pro Kameraclip eine Datei mit allen synchronen Tonspuren\n\n"
+               "Ordner mit Anzeigenamen: --audio Interviewer=/pfad/lav1")
+    ap.add_argument("mode", choices=MODES)
+    ap.add_argument("--audio", action="append", metavar="[NAME=]PFAD",
+                    help="Tonordner (beliebig oft); der erste ist die Sync-Referenz")
+    ap.add_argument("--video", metavar="[NAME=]PFAD", help="Ordner der (Haupt-)Kamera")
+    ap.add_argument("--pip", metavar="[NAME=]PFAD", help="nur merge: zweite Kamera als Bild-im-Bild")
+    ap.add_argument("--info", action="store_true", help="Dateinamen und Timecodes einblenden")
+    ap.add_argument("--only_new_audio", "--only-new-audio", action="store_true",
+                    help="Kameraton weglassen (wird zum Synchronisieren trotzdem verwendet)")
+    ap.add_argument("--full_quality_video", "--full-quality-video", action="store_true",
+                    help="Originalauflösung/-bildrate; sync-to-video ohne --info kopiert das Bild unverändert")
+    ap.add_argument("--full_quality_audio", "--full-quality-audio", action="store_true",
+                    help="Ton unbearbeitet als PCM, ohne Rauschunterdrückung/Lautstärkeanpassung")
+    ap.add_argument("-o", "--output", type=Path, help="Ausgabeordner (Standard: Ordner über dem Kameraordner)")
+    ap.add_argument("-n", "--name", help="Name der Ausgabe (sync-to-video: Präfix der Dateinamen)")
+    ap.add_argument("--fresh", action="store_true", help="Zwischenstand ignorieren, komplett neu")
+    ap.add_argument("--dry-run", action="store_true", help="nur Zeiten erkennen und anzeigen")
+    ap.add_argument("--config", type=Path, help="config.json (Standard: neben dem Skript)")
+    args = ap.parse_args()
+    if not args.audio:
+        ap.error("mindestens ein --audio-Ordner ist nötig")
+    if not args.video:
+        ap.error("--video fehlt")
+    if args.pip and args.mode != "merge":
+        ap.error("--pip gibt es nur im Modus merge")
+    return args
 
 
 def main():
@@ -1098,34 +1159,20 @@ def main():
         signal.signal(signal.SIGINT, _on_sigint)
     except (ValueError, OSError):
         pass
-    ap = argparse.ArgumentParser(description="Lavs + Sony + GoPro -> ein Interview-Video")
-    ap.add_argument("project", type=Path)
-    ap.add_argument("--dry-run", action="store_true", help="nur Zeiten erkennen und Timeline ausgeben")
-    ap.add_argument("--no-sync", action="store_true", help="keine Audio-Feinsynchronisierung")
-    ap.add_argument("--config", type=Path, help="Pfad zu config.json (Standard: projekt/config.json)")
-    ap.add_argument("--keep-temp", action="store_true")
-    ap.add_argument("-n", "--name",
-                    help="Dateiname des fertigen Videos, z.B. interview_kim (.mov wird ergänzt)")
-    ap.add_argument("-o", "--output", type=Path,
-                    help="Ausgabeordner für Video, Report und Zwischendateien (Standard: Projektordner)")
-    ap.add_argument("--no-cut", action="store_true", help="Pausen ohne Bild und Ton NICHT herausschneiden")
-    ap.add_argument("--raw-audio", action="store_true", help="Ton NICHT aufbereiten (Originalpegel)")
-    ap.add_argument("--fresh", action="store_true",
-                    help="Zwischenstand eines abgebrochenen Laufs ignorieren und komplett neu rendern")
-    args = ap.parse_args()
-
+    args = parse_args()
     for tool in ("ffmpeg", "ffprobe"):
         if not shutil.which(tool):
-            sys.exit(f"{tool} nicht gefunden – bitte installieren (Mac: brew install ffmpeg).")
-    root = args.project.resolve()
-    if np is None and not args.no_sync and not args.dry_run:
-        sys.exit("numpy fehlt – ohne numpy kein Audio-Sync.\n"
-                 "Installieren (siehe Anleitung) oder bewusst ohne Sync starten: --no-sync")
+            sys.exit(f"{tool} nicht gefunden – bitte installieren (Mac: source setup.sh).")
+
     cfg = DEFAULT_CONFIG
-    cfg_path = args.config or root / "config.json"
+    cfg_path = args.config or Path(__file__).resolve().with_name("config.json")
     if cfg_path.exists():
         cfg = deep_merge(cfg, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
         print(f"Config: {cfg_path}")
+    elif args.config:
+        sys.exit(f"Config nicht gefunden: {cfg_path}")
+    if "lav_to_lav" in cfg["audio_sync"]:
+        cfg["audio_sync"]["audio_to_audio"] = cfg["audio_sync"]["lav_to_lav"]
 
     global TARGET_TZ
     if cfg.get("timezone"):
@@ -1134,38 +1181,62 @@ def main():
         TARGET_TZ = ZoneInfo(cfg["timezone"])
         print(f"Geräte-Zeitzone: {cfg['timezone']}")
 
+    mode = args.mode
+    o = cfg["output"]
+    full_v, full_a = args.full_quality_video, args.full_quality_audio
+    sources = parse_sources(args, cfg)
+    audio_srcs = [s for s in sources if s.kind == "audio"]
+    video_src = next(s for s in sources if s.kind == "video")
+    pip_src = next((s for s in sources if s.kind == "pip"), None)
+    vids = [video_src] + ([pip_src] if pip_src else [])
+
+    print(f"Modus: {mode}")
     print("Lese Dateien ...")
-    clips = load_clips(root, cfg)
-    chain_and_join(clips, cfg["join_tolerance_s"])
-    every = [c for s in SOURCES for c in clips[s]]
-    if not every:
-        sys.exit("Keine Mediendateien gefunden.")
+    clips = load_clips(sources)
+    chain_and_join(clips, sources, cfg["join_tolerance_s"])
+    audio_srcs = [s for s in audio_srcs if clips[s.key]]
+    if not audio_srcs:
+        sys.exit("Keine Tondateien gefunden.")
+    if not clips[video_src.key]:
+        sys.exit(f"Keine Videodateien in {video_src.path}")
+    every = [c for s in sources for c in clips[s.key]]
     t0 = min(c.start_dt for c in every)
     for c in every:
         c.start = (c.start_dt - t0).total_seconds()
     total = max(c.end for c in every)
 
-    if args.dry_run:
-        markers = [] if args.no_cut else cut_gaps(every, t0, cfg["cut_gaps"])
-        total = max(c.end for c in every)
-        print("\n" + report(clips, t0, total, markers))
-        return
-
-    sr = cfg["output"]["audio_rate"]
-    fps = cfg["output"]["fps"]
-    out_dir = args.output or (Path(cfg["output"]["dir"]).expanduser() if cfg["output"].get("dir") else root)
-    out_dir = out_dir.resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_name = cfg["output"]["file"]
-    report_name = "interview_merge_report.txt"
-    if args.name:
-        out_name = Path(args.name).name
+    project = video_src.path if video_src.path.is_dir() else video_src.path.parent
+    project = project.parent
+    out_dir = (args.output or project).expanduser().resolve()
+    base = args.name or (f"{project.name}_{mode.replace('-', '_')}" if mode != "sync-to-video" else "")
+    if mode == "sync-to-video":
+        prefix = f"{args.name}_" if args.name else ""
+        work_name = safe_name(f"{prefix}{video_src.name}_synced")
+        report_name = f"{work_name}_report.txt"
+        out_name = None
+    else:
+        out_name = Path(base).name
         if Path(out_name).suffix.lower() not in (".mov", ".mp4", ".mkv"):
             out_name += ".mov"
+        work_name = safe_name(Path(out_name).stem)
         report_name = Path(out_name).stem + "_report.txt"
-    print(f"Ausgabe: {out_dir / out_name}")
-    # fester Arbeitsordner pro Ausgabedatei -> nach Abbruch kann derselbe Befehl fortsetzen
-    tmp = out_dir / ("imerge_" + re.sub(r"[^\w.-]+", "_", Path(out_name).stem))
+
+    if args.dry_run:
+        markers = cut_gaps(every, t0, cfg["cut_gaps"]) if mode != "sync-to-video" else []
+        total = max(c.end for c in every)
+        print("\n" + report(sources, clips, t0, total, markers))
+        if mode == "sync-to-video":
+            print("Geplante Ausgaben:")
+            for c in clips[video_src.key]:
+                print(f"  {out_dir / (prefix + c.path.stem + '_synced.mov')}")
+        else:
+            print(f"Geplante Ausgabe: {out_dir / out_name}")
+        return
+    if np is None and cfg["audio_sync"]["enabled"]:
+        sys.exit("numpy fehlt – ohne numpy kein Audio-Sync. Terminal vorbereiten: source setup.sh")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tmp = out_dir / ("imerge_" + work_name)
     tmp.mkdir(exist_ok=True)
     lock = tmp / "läuft.lock"
     try:
@@ -1173,35 +1244,31 @@ def main():
     except FileNotFoundError:
         age = None
     if age is not None and age < 90:
-        sys.exit(f"Für {out_name} läuft bereits ein anderer Durchgang (Sperrdatei {lock}).\n"
+        sys.exit(f"Für {work_name} läuft bereits ein anderer Durchgang (Sperrdatei {lock}).\n"
                  f"Warte, bis er fertig ist. Falls sicher keiner mehr läuft: Datei löschen und neu starten.")
     lock.write_text(f"pid {os.getpid()}\n", encoding="utf-8")
     stop_beat = threading.Event()
 
-    def heartbeat():                         # Sperre aktuell halten, solange dieser Lauf lebt
+    def heartbeat():
         while not stop_beat.wait(20):
             try:
                 os.utime(lock)
             except OSError:
                 pass
     threading.Thread(target=heartbeat, daemon=True).start()
-    _prev = [k for k in load_manifest(tmp / "segments.json") if not k.startswith("__")]
-    _ana = (tmp / "analyse.json").exists()
-    if (_prev or _ana) and not args.fresh:
-        print(f"Zwischenstand gefunden in {tmp.name}: "
-              + ("Analyse/Sync" if _ana else "")
-              + (", " if _ana and _prev else "")
-              + (f"{len(_prev)} fertige Video-Segmente" if _prev else "")
-              + " – wird übernommen, soweit Quellen und Einstellungen gleich sind")
-    elif not args.fresh and any(re.fullmatch(r"imerge_[a-z0-9_]{8}", d.name) for d in out_dir.glob("imerge_*")):
-        print("Alter Zwischenordner der Vorversion gefunden – wird nach Analyse und Sync geprüft")
+    if not args.fresh and ((tmp / "analyse.json").exists() or (tmp / "segments.json").exists()):
+        print(f"Zwischenstand gefunden in {tmp.name} – wird übernommen, soweit Quellen und Einstellungen gleich sind")
     finished = False
-    legacy_used = []
-    wavs = {s: tmp / f"{s}.wav" for s in SOURCES}
+    sr = o["audio_rate"]
+    scfg = cfg["audio_sync"]
+    wavs = {s.key: tmp / f"{s.key}.wav" for s in sources}
+    cam_ch = {s.key: (min(2, max((c.channels for c in clips[s.key]), default=1)) if full_a else 1) for s in vids}
+
     try:
+        # ------------------------------------------------------------- Analyse + Sync
         sfile = tmp / "analyse.json"
-        key = analyse_key(every, cfg, args)
-        state = None if args.fresh else load_manifest(sfile)
+        key = analyse_key(every, sources, cfg, mode)
+        state = None if args.fresh else load_json(sfile)
         if state and state.get("key") != key:
             print("  Quelldateien oder Einstellungen haben sich geändert – Analyse läuft neu")
             state = None
@@ -1212,7 +1279,10 @@ def main():
 
         def wav_done(name, path):
             state.setdefault("wavs", {})[name] = path.stat().st_size
-            save_state(sfile, state)
+            save_json(sfile, state)
+
+        def build_aud(s):
+            build_audio_track(clips[s.key], total, wavs[s.key], 1, sr)
 
         if state:
             print("Analyse und Sync aus dem vorherigen Lauf übernommen (Quellen und Einstellungen unverändert)")
@@ -1224,272 +1294,405 @@ def main():
             total = state["total"]
             markers = [GapMarker(m["pos"], m["keep"], datetime.fromisoformat(m["rs"]),
                                  datetime.fromisoformat(m["re"])) for m in state["markers"]]
-            for s in LAV_SOURCES:
-                if not wav_ok(s, wavs[s]):
-                    print(f"Baue {cfg['track_names'][s]} neu ...")
-                    build_audio_track(clips[s], total, wavs[s], cfg["sources"][s]["channels"], sr)
-                    wav_done(s, wavs[s])
+            for s in audio_srcs:
+                if not wav_ok(s.key, wavs[s.key]):
+                    print(f"Baue Tonspur {s.name} neu ...")
+                    build_aud(s)
+                    wav_done(s.key, wavs[s.key])
         else:
-            do_sync = cfg["audio_sync"]["enabled"] and not args.no_sync and np is not None
-            l1, l2 = LAV_SOURCES
-            print("Baue Lav-Spuren ...")
-            build_audio_track(clips[l1], total, wavs[l1], cfg["sources"][l1]["channels"], sr)
-            if do_sync and cfg["audio_sync"]["lav_to_lav"] and clips[l1] and clips[l2]:
-                print("Synchronisiere Lav 2 auf Lav 1 ...")
-                fine_sync(clips[l2], [wavs[l1]], cfg["audio_sync"])
-            build_audio_track(clips[l2], total + 5, wavs[l2], cfg["sources"][l2]["channels"], sr)
-
-            cams = clips["sony"] + clips["gopro"]
-            if cfg["audio_sync"]["enabled"] and not args.no_sync and cams:
-                if np is None:
-                    print("  ! numpy fehlt – Audio-Sync übersprungen (pip install numpy)")
-                elif not any(clips[s] for s in LAV_SOURCES):
-                    print("  ! keine Lavs – Audio-Sync übersprungen")
-                else:
-                    print("Synchronisiere Kameraclips über den Ton ...")
-                    refine_sync(cams, [wavs[s] for s in LAV_SOURCES if clips[s]], cfg["audio_sync"], total,
-                                [c for s in LAV_SOURCES for c in clips[s]])
+            do_sync = scfg["enabled"]
+            ref = audio_srcs[0]
+            print(f"Baue Tonspuren (Referenz: {ref.name}) ...")
+            build_aud(ref)
+            if do_sync and scfg.get("audio_to_audio", True) and len(audio_srcs) > 1:
+                print(f"Synchronisiere weitere Tonquellen auf {ref.name} ...")
+                refine_sync([(s.name, clips[s.key]) for s in audio_srcs[1:]], [wavs[ref.key]],
+                            clips[ref.key], scfg, total)
+            for s in audio_srcs[1:]:
+                build_aud(s)
+            if do_sync:
+                print("Synchronisiere Kameras über den Ton ...")
+                refine_sync([(s.name, clips[s.key]) for s in vids], [wavs[s.key] for s in audio_srcs],
+                            [c for s in audio_srcs for c in clips[s.key]], scfg, total)
             shift = -min(c.start for c in every)
             for c in every:
                 c.start += shift
             t0 -= timedelta(seconds=shift)
-            markers = [] if args.no_cut else cut_gaps(every, t0, cfg["cut_gaps"])
-            total = max(c.end for c in every)
-            if abs(shift) > 1e-3 or markers:
+            if mode == "sync-to-video":
+                for c in every:
+                    c.real_dt = t0 + timedelta(seconds=c.start)
+                markers = []
+            else:
+                markers = cut_gaps(every, t0, cfg["cut_gaps"])
                 if markers:
                     print(f"{len(markers)} Pause(n) ohne Bild und Ton herausgeschnitten.")
-                print("Baue Lav-Spuren an den neuen Positionen ...")
-                for s in LAV_SOURCES:
-                    build_audio_track(clips[s], total, wavs[s], cfg["sources"][s]["channels"], sr)
+            total = max(c.end for c in every)
+            print("Baue Tonspuren an den endgültigen Positionen ...")
+            for s in audio_srcs:
+                build_aud(s)
             state = {"key": key, "t0": t0.isoformat(), "total": total,
                      "clips": {cid(c): {"start": c.start, "drift": c.drift, "note": c.sync_note,
                                         "real": c.real_dt.isoformat() if c.real_dt else None} for c in every},
                      "markers": [{"pos": m.pos, "keep": m.keep, "rs": m.real_start.isoformat(),
-                                  "re": m.real_end.isoformat()} for m in markers], "wavs": {}}
-            for s in LAV_SOURCES:
-                state["wavs"][s] = wavs[s].stat().st_size if wavs[s].exists() else None
-            save_state(sfile, state)
+                                  "re": m.real_end.isoformat()} for m in markers],
+                     "wavs": {s.key: wavs[s.key].stat().st_size for s in audio_srcs}}
+            save_json(sfile, state)
 
-        rep = report(clips, t0, total, markers)
+        rep = report(sources, clips, t0, total, markers)
         print("\n" + rep)
         (out_dir / report_name).write_text(rep, encoding="utf-8")
 
-        if all(wav_ok(s, wavs[s]) for s in VIDEO_SOURCES):
-            print("Kamera-Tonspuren aus dem vorherigen Lauf übernommen")
-        else:
-            print("Baue Kamera-Tonspuren ...")
-            for s in VIDEO_SOURCES:
-                if not wav_ok(s, wavs[s]):
-                    build_audio_track(clips[s], total, wavs[s], cfg["sources"][s]["channels"], sr)
-                    wav_done(s, wavs[s])
-
-        filters = run(["ffmpeg", "-hide_banner", "-filters"]).decode(errors="replace")
-        use_text = " drawtext " in filters
-        if not use_text:
-            print("  ! ffmpeg ohne drawtext – Dateinamen werden NICHT eingeblendet")
-        total_f = int(round(total * fps))
-        segs = build_segments(clips["sony"], clips["gopro"], clips["lav_interviewer"],
-                              clips["lav_befragter"], total_f, fps)
-        mfile = tmp / "segments.json"
-        manifest = {} if args.fresh else load_manifest(mfile)
-        print(f"Arbeitsordner: {tmp}")
-        want_auto = cfg["output"]["vcodec"] == "auto"
-        enc = resolve_encoder(cfg["output"])
-        prev_enc = manifest.get("__encoder__")
-        if want_auto and prev_enc and prev_enc != enc and (prev_enc in SOFTWARE_ENCODERS or encoder_works(prev_enc)):
-            print(f"  Vorheriger Lauf nutzte {prev_enc} – bleibe dabei, damit der Zwischenstand passt")
-            enc = prev_enc
-        total_frames = sum(b - a for a, b, *_ in segs)
-
-        # alte Arbeitsordner der Vorversion (Zufallsname) nach brauchbaren Segmenten durchsuchen
-        legacy = None if args.fresh else find_legacy(out_dir, tmp, segs, cfg["output"])
-        if legacy:
-            ldir, lfiles, lenc = legacy
-            lframes = sum(segs[i][1] - segs[i][0] for i in range(len(lfiles)))
-            frac = lframes / max(total_frames, 1)
-            if lenc != enc and not (lenc in SOFTWARE_ENCODERS and enc not in SOFTWARE_ENCODERS and frac < 0.75):
-                print(f"  Alter Lauf mit {lenc}: übernehme dessen Encoder, damit die Segmente zusammenpassen")
-                enc = lenc
-            if lenc == enc:
-                print(f"Vorheriger Lauf gefunden ({ldir.name}): {len(lfiles)} Segmente "
-                      f"({frac * 100:.0f}%) werden übernommen")
-            else:
-                print(f"Vorheriger Lauf ({ldir.name}, {lenc}) nur zu {frac * 100:.0f}% fertig – "
-                      f"mit {enc} komplett neu zu rendern ist schneller")
-                legacy = None
-        cfg["output"]["vcodec"] = enc
-
-        jobs = cfg["output"].get("jobs", "auto")
-        if jobs == "auto":
-            jobs = 1 if enc in SOFTWARE_ENCODERS else 3
-        jobs = max(1, int(jobs))
-        hw = cfg["output"].get("hwaccel", "auto")
-        print(f"Video-Encoder: {enc}  |  Decoding: {'Software' if not hw or hw == 'none' else 'Hardware (' + hw + ')'}"
-              f"  |  parallel: {jobs}")
-
-        r = SegmentRenderer(cfg, tmp, use_text, markers)
-        listfile = tmp / "segments.txt"
-        sigs = [r.signature(*sg) for sg in segs]
-        seg_files = [tmp / f"seg_{sg}.mov" for sg in sigs]
-
-        if legacy:
-            ldir, lfiles, _ = legacy
-            for i, f in enumerate(lfiles):
-                os.replace(f, seg_files[i])
-                manifest[sigs[i]] = seg_files[i].name
-            save_manifest(mfile, manifest)
-            legacy_used.append(ldir)
-
-        manifest["__encoder__"] = enc
-        # was ist schon fertig?
-        saved = {k for k in manifest if not k.startswith("__")}
-        todo, broken = [], 0
-        for i, (sg, f) in enumerate(zip(sigs, seg_files)):
-            ok = False
-            if manifest.get(sg) == f.name and f.exists():
-                info = probe_segment(f)
-                ok = info is not None and info["frames"] == segs[i][1] - segs[i][0]
-                broken += not ok
-            if not ok:
-                todo.append(i)
-        if saved:
-            match = len(saved & set(sigs))
-            print(f"  Gespeicherter Zwischenstand: {len(saved)} Segmente, {match} passen zum aktuellen Plan"
-                  + (f", {broken} davon beschädigt" if broken else ""))
-            if match < len(saved):
-                print("  (nicht passende stammen aus einem Lauf mit anderen Einstellungen, anderem Encoder "
-                      "oder anderem Sync-Ergebnis)")
-        elif not legacy:
-            print("  Noch keine fertigen Video-Segmente – rendere alle")
-        reused = len(segs) - len(todo)
-        if reused:
-            done_f = total_frames - sum(segs[i][1] - segs[i][0] for i in todo)
-            print(f"Fortsetzen: {reused}/{len(segs)} Segmente schon fertig "
-                  f"({done_f / max(total_frames, 1) * 100:.0f}%), rendere die restlichen {len(todo)}")
-
-        todo_frames = sum(segs[i][1] - segs[i][0] for i in todo)
-        done = {"frames": 0}
-        t_start = time.time()
-        plock = threading.Lock()
-
-        def work(i):
-            a, b, main, pip, lavs = segs[i]
-            part = seg_files[i].with_name(seg_files[i].stem + ".part.mov")
-            r.render(part, a, b, main, pip, lavs)
-            os.replace(part, seg_files[i])
-            with plock:
-                manifest[sigs[i]] = seg_files[i].name
-                save_manifest(mfile, manifest)
-                done["frames"] += b - a
-                el = time.time() - t_start
-                frac = done["frames"] / max(todo_frames, 1)
-                eta = el / frac - el if frac > 0 else 0
-                overall = (total_frames - todo_frames + done["frames"]) / max(total_frames, 1)
-                name = main.path.name if main else "schwarz"
-                if pip:
-                    name += f" + PiP {pip.path.name}"
-                print(f"  [{overall * 100:5.1f}%] Segment {i + 1}/{len(segs)}  {hms(a / fps)} – {hms(b / fps)}  {name}"
-                      f"   (Tempo {(done['frames'] / fps) / max(el, 1e-6):.1f}x, Rest ca. {hms(eta, False)})")
-
-        if jobs == 1:
-            for i in todo:
-                work(i)
-        else:
-            ex = ThreadPoolExecutor(max_workers=jobs)
-            futures = [ex.submit(work, i) for i in todo]
-            try:
-                for f in futures:
-                    f.result()
-            except BaseException:
-                ABORT.set()
-                for f in futures:          # Strg+C oder Fehler: nichts Neues mehr anfangen
-                    f.cancel()
-                ex.shutdown(wait=False)
-                raise
-            ex.shutdown()
-        if todo:
-            print(f"  Video gerendert in {hms(time.time() - t_start, False)}")
-        with listfile.open("w") as lf:
-            for seg in seg_files:
-                lf.write(f"file '{seg.as_posix().replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n")
-
-        print("Füge zusammen ...")
-        video = tmp / "video.mov"
-        run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", listfile, "-c", "copy", video])
-        out = out_dir / out_name
-        final_wavs = dict(wavs)
+        # ------------------------------------------------------------- Tonaufbereitung
         pcfg = cfg["audio_processing"]
-        if pcfg.get("enabled") and not args.raw_audio:
-            chain = audio_chain(pcfg)
+        chain = audio_chain(pcfg) if pcfg.get("enabled") and not full_a else ""
+        chain_tag = hashlib.sha1(chain.encode()).hexdigest()[:10]
+        final = {}
+        if chain:
+            print("Bereite Ton für Transkription auf (Hochpass, Rauschunterdrückung, Lautstärke) ...")
+        for s in audio_srcs:
+            final[s.key] = wavs[s.key]
             if chain:
-                print("Bereite Ton für Transkription auf (Hochpass, Rauschunterdrückung, Lautstärke) ...")
-                for s in SOURCES:
-                    if s in pcfg.get("apply_to", SOURCES) and clips[s]:
-                        print(f"  {cfg['track_names'][s]} ...")
-                        final_wavs[s] = tmp / f"{s}_processed.wav"
-                        pname = f"{s}_processed|{hashlib.sha1(chain.encode()).hexdigest()[:10]}"
-                        if wav_ok(pname, final_wavs[s]):
-                            print("    (aus dem vorherigen Lauf übernommen)")
-                            continue
-                        run(["ffmpeg", "-y", "-v", "error", "-i", wavs[s], "-af", chain,
-                             "-c:a", "pcm_s24le", "-rf64", "auto", final_wavs[s]])
-                        wav_done(pname, final_wavs[s])
-        cmd = ["ffmpeg", "-y", "-v", "error", "-i", video]
-        for s in SOURCES:
-            cmd += ["-i", final_wavs[s]]
-        if cfg["output"]["audio_tracks"] == "single":
-            # eine Spur mit 4 Kanälen – liest Resolve zuverlässig als Embedded Channel 1–4
-            graph = ";".join(f"[{i + 1}:a]aformat=channel_layouts=mono[m{i}]" for i in range(len(SOURCES)))
-            graph += ";" + "".join(f"[m{i}]" for i in range(len(SOURCES)))
-            graph += f"amerge=inputs={len(SOURCES)}[a]"
-            cmd += ["-filter_complex", graph, "-map", "0:v", "-map", "[a]", "-c:v", "copy"]
-            if cfg["output"]["audio_codec"] == "pcm":
-                cmd += ["-c:a", "pcm_s24le"]
-            else:
-                cmd += ["-c:a", "aac", "-b:a", cfg["output"]["aac_single"]]
-            names = " | ".join(f"Ch{i + 1} {cfg['track_names'][s]}" for i, s in enumerate(SOURCES))
-            cmd += ["-metadata:s:a:0", f"title={names}"]
+                p = tmp / f"{s.key}_processed.wav"
+                pname = f"{s.key}_processed|{chain_tag}"
+                if not wav_ok(pname, p):
+                    print(f"  {s.name} ...")
+                    run(["ffmpeg", "-y", "-v", "error", "-i", wavs[s.key], "-af", chain,
+                         "-c:a", "pcm_s24le", "-rf64", "auto", p])
+                    wav_done(pname, p)
+                final[s.key] = p
+
+        overlay = Overlay(cfg, tmp, args.info)
+        if args.info:
+            filters = run(["ffmpeg", "-hide_banner", "-filters"]).decode(errors="replace")
+            if " drawtext " not in filters:
+                print("  ! ffmpeg ohne drawtext – Einblendungen nicht möglich (source setup.sh)")
+                overlay.enabled = False
+
+        if mode == "sync-to-video":
+            run_sync_to_video(args, cfg, clips, video_src, audio_srcs, final, chain, tmp, out_dir, prefix,
+                              overlay, state, sfile)
         else:
-            cmd += ["-map", "0:v"] + [x for i in range(len(SOURCES)) for x in ("-map", f"{i + 1}:a")]
-            cmd += ["-c:v", "copy"]
-            if cfg["output"]["audio_codec"] == "pcm":
-                cmd += ["-c:a", "pcm_s24le"]
-            else:
-                cmd += ["-c:a", "aac"]
-                for i, s in enumerate(SOURCES):
-                    mono = cfg["sources"][s]["channels"] == "mono"
-                    cmd += [f"-b:a:{i}", cfg["output"]["aac_mono"] if mono else cfg["output"]["aac_stereo"]]
-            for i, s in enumerate(SOURCES):
-                name = cfg["track_names"][s]
-                cmd += [f"-metadata:s:a:{i}", f"title={name}", f"-metadata:s:a:{i}", f"handler_name={name}"]
-        part_out = out.with_name(out.stem + ".part" + out.suffix)
-        run(cmd + [part_out])
-        os.replace(part_out, out)
+            run_merge(args, cfg, clips, sources, video_src, pip_src, audio_srcs, vids, final, chain,
+                      tmp, out_dir, out_name, total, markers, overlay, wav_ok, wav_done, cam_ch, wavs)
         finished = True
-        print(f"\nFertig: {out}\nReport: {out_dir / report_name}")
     finally:
         stop_beat.set()
         try:
             lock.unlink()
         except OSError:
             pass
-        if args.keep_temp:
-            print(f"Arbeitsordner behalten: {tmp}")
-        elif finished:
+        if finished:
             shutil.rmtree(tmp, ignore_errors=True)
-            for d in legacy_used:
-                shutil.rmtree(d, ignore_errors=True)
-            rest = [d.name for d in out_dir.glob("imerge_*") if d.is_dir()]
-            if rest:
-                print(f"Hinweis: In {out_dir} liegen noch Zwischenordner anderer bzw. alter Läufe: "
-                      f"{', '.join(rest)}. Wenn dort gerade nichts mehr läuft, kannst du sie löschen.")
         else:
             print(f"\nAbgebrochen. Der Zwischenstand bleibt in {tmp}.\n"
                   f"Zum Fortsetzen einfach denselben Befehl nochmal starten (mit --fresh komplett neu).")
+
+
+def pick_jobs(o, enc):
+    jobs = o.get("jobs", "auto")
+    if jobs == "auto":
+        jobs = 1 if enc in SOFTWARE_ENCODERS else 3
+    return max(1, int(jobs))
+
+
+def run_parallel(jobs, items, fn):
+    if jobs == 1:
+        for it in items:
+            fn(it)
+        return
+    ex = ThreadPoolExecutor(max_workers=jobs)
+    futures = [ex.submit(fn, it) for it in items]
+    try:
+        for f in futures:
+            f.result()
+    except BaseException:
+        ABORT.set()
+        for f in futures:
+            f.cancel()
+        ex.shutdown(wait=False)
+        raise
+    ex.shutdown()
+
+
+def setup_encoder(o, manifest):
+    want_auto = o["vcodec"] == "auto"
+    enc = resolve_encoder(o)
+    prev = manifest.get("__encoder__")
+    if want_auto and prev and prev != enc and (prev in SOFTWARE_ENCODERS or encoder_works(prev)):
+        print(f"  Vorheriger Lauf nutzte {prev} – bleibe dabei, damit der Zwischenstand passt")
+        enc = prev
+    o["vcodec"] = enc
+    manifest["__encoder__"] = enc
+    return enc
+
+
+# --------------------------------------------------------------------------- merge / sync-to-audio
+def run_merge(args, cfg, clips, sources, video_src, pip_src, audio_srcs, vids, final, chain,
+              tmp, out_dir, out_name, total, markers, overlay, wav_ok, wav_done, cam_ch, wavs):
+    o = cfg["output"]
+    sr = o["audio_rate"]
+    full_a = args.full_quality_audio
+    if args.full_quality_video:
+        full_quality_settings(o, max(clips[video_src.key], key=lambda c: c.duration))
+
+    # Kameraton als Timeline-Spur
+    cam_tracks = []
+    if not args.only_new_audio:
+        for s in vids:
+            if not any(c.has_audio for c in clips[s.key]):
+                continue
+            name = f"{s.key}|ch{cam_ch[s.key]}"
+            if not wav_ok(name, wavs[s.key]):
+                print(f"Baue Kamera-Tonspur {s.name} ...")
+                build_audio_track(clips[s.key], total, wavs[s.key], cam_ch[s.key], sr)
+                wav_done(name, wavs[s.key])
+            p = wavs[s.key]
+            if chain:
+                pp = tmp / f"{s.key}_processed.wav"
+                pname = f"{s.key}_processed|{hashlib.sha1(chain.encode()).hexdigest()[:10]}"
+                if not wav_ok(pname, pp):
+                    run(["ffmpeg", "-y", "-v", "error", "-i", p, "-af", chain,
+                         "-c:a", "pcm_s24le", "-rf64", "auto", pp])
+                    wav_done(pname, pp)
+                p = pp
+            cam_tracks.append((s.name, p, cam_ch[s.key]))
+
+    fps = o["fps"]
+    total_f = int(round(total * fps))
+    segs = build_segments(clips[video_src.key], clips[pip_src.key] if pip_src else [],
+                          [clips[s.key] for s in audio_srcs], total_f, fps)
+    mfile = tmp / "segments.json"
+    manifest = {} if args.fresh else load_json(mfile)
+    print(f"Arbeitsordner: {tmp}")
+    enc = setup_encoder(o, manifest)
+    jobs = pick_jobs(o, enc)
+    hw = o.get("hwaccel", "auto")
+    print(f"Video-Encoder: {enc}  |  {o['width']}x{o['height']} @ {o.get('fps_str', fps)}  |  Decoding: "
+          f"{'Software' if not hw or hw == 'none' else 'Hardware'}  |  parallel: {jobs}  |  Einblendungen: "
+          f"{'ja' if overlay.enabled else 'nein'}")
+
+    r = SegmentRenderer(cfg, tmp, overlay, audio_srcs, markers)
+    sigs = [r.signature(*sg) for sg in segs]
+    seg_files = [tmp / f"seg_{sg}.mov" for sg in sigs]
+    total_frames = sum(b - a for a, b, *_ in segs)
+    todo = []
+    for i, (sg, f) in enumerate(zip(sigs, seg_files)):
+        if not (manifest.get(sg) == f.name and f.exists() and probe_frames(f) == segs[i][1] - segs[i][0]):
+            todo.append(i)
+    saved = [k for k in manifest if not k.startswith("__")]
+    if saved:
+        match = len(set(saved) & set(sigs))
+        print(f"  Gespeicherter Zwischenstand: {len(saved)} Segmente, {match} passen zum aktuellen Plan")
+    if len(todo) < len(segs):
+        done_f = total_frames - sum(segs[i][1] - segs[i][0] for i in todo)
+        print(f"Fortsetzen: {len(segs) - len(todo)}/{len(segs)} Segmente schon fertig "
+              f"({done_f / max(total_frames, 1) * 100:.0f}%), rendere die restlichen {len(todo)}")
+    todo_frames = sum(segs[i][1] - segs[i][0] for i in todo)
+    done = {"frames": 0}
+    t_start = time.time()
+    plock = threading.Lock()
+
+    def work(i):
+        a, b, main, pip, auds = segs[i]
+        part = seg_files[i].with_name(seg_files[i].stem + ".part.mov")
+        r.render(part, a, b, main, pip, auds)
+        os.replace(part, seg_files[i])
+        with plock:
+            manifest[sigs[i]] = seg_files[i].name
+            save_json(mfile, manifest)
+            done["frames"] += b - a
+            el = time.time() - t_start
+            frac = done["frames"] / max(todo_frames, 1)
+            eta = el / frac - el if frac > 0 else 0
+            overall = (total_frames - todo_frames + done["frames"]) / max(total_frames, 1)
+            name = main.path.name if main else "schwarz"
+            if pip:
+                name += f" + PiP {pip.path.name}"
+            print(f"  [{overall * 100:5.1f}%] Segment {i + 1}/{len(segs)}  {hms(a / fps)} – {hms(b / fps)}  {name}"
+                  f"   (Tempo {(done['frames'] / fps) / max(el, 1e-6):.1f}x, Rest ca. {hms(eta, False)})")
+
+    run_parallel(jobs, todo, work)
+    if todo:
+        print(f"  Video gerendert in {hms(time.time() - t_start, False)}")
+    listfile = tmp / "segments.txt"
+    listfile.write_text("".join(concat_line(f) for f in seg_files), encoding="utf-8")
+    print("Füge zusammen ...")
+    video = tmp / "video.mov"
+    run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", listfile, "-c", "copy", video])
+
+    tracks = [(s.name, final[s.key], 1) for s in audio_srcs] + cam_tracks
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", video]
+    for _, p, _ in tracks:
+        cmd += ["-i", p]
+    amap, meta = mux_audio_graph([t[1] for t in tracks], [t[0] for t in tracks], 1, o, full_a,
+                                 [t[2] for t in tracks])
+    cmd += ["-map", "0:v", "-c:v", "copy"] + amap + meta
+    out = out_dir / out_name
+    part_out = out.with_name(out.stem + ".part" + out.suffix)
+    run(cmd + [part_out])
+    os.replace(part_out, out)
+    print(f"\nFertig: {out}\n  Tonkanäle: " + channel_labels([t[0] for t in tracks],
+                                                              [t[2] if full_a else 1 for t in tracks]))
+
+
+# --------------------------------------------------------------------------- sync-to-video
+def run_sync_to_video(args, cfg, clips, video_src, audio_srcs, final, chain, tmp, out_dir, prefix,
+                      overlay, state, sfile):
+    o = cfg["output"]
+    sr = o["audio_rate"]
+    full_v, full_a = args.full_quality_video, args.full_quality_audio
+    copy_video = full_v and not overlay.enabled
+    mfile = tmp / "segments.json"
+    manifest = {} if args.fresh else load_json(mfile)
+    print(f"Arbeitsordner: {tmp}")
+    if copy_video:
+        enc = "copy"
+        jobs = 2
+    else:
+        enc = setup_encoder(o, manifest)
+        jobs = pick_jobs(o, enc)
+    hw = o.get("hwaccel", "auto")
+    hwargs = [] if not hw or hw == "none" else ["-hwaccel", hw]
+    vclips = clips[video_src.key]
+    res_txt = "Originalauflösung" if full_v else "{}x{} @ {}".format(o["width"], o["height"], o["fps"])
+    print(f"Video: {'unverändert kopiert' if copy_video else enc}  |  {res_txt}  |  "
+          f"parallel: {jobs}  |  Einblendungen: {'ja' if overlay.enabled else 'nein'}")
+
+    def out_path(c):
+        return out_dir / f"{prefix}{c.path.stem}_synced.mov"
+
+    def signature(c):
+        data = [6, state["key"], str(c.path), copy_video, full_v, full_a, args.only_new_audio, overlay.enabled,
+                chain, o["audio_tracks"], [s.name for s in audio_srcs],
+                None if copy_video else vcodec_args(o), None if full_v else [o["width"], o["height"], o["fps"]],
+                cfg["text"] if overlay.enabled else None]
+        return hashlib.sha1(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+    todo, skipped = [], 0
+    for c in vclips:
+        f = out_path(c)
+        if manifest.get(signature(c)) == f.name and f.exists() and probe_frames(f):
+            skipped += 1
+        else:
+            todo.append(c)
+    if skipped:
+        print(f"Fortsetzen: {skipped}/{len(vclips)} Clips schon fertig, bearbeite die restlichen {len(todo)}")
+    plock = threading.Lock()
+    t_start = time.time()
+    done = {"n": 0, "dur": 0.0}
+    todo_dur = sum(c.duration for c in todo)
+
+    def video_args(c, hw_in):
+        """Eingang 0 = Video. Liefert (Eingangsargumente, Video-Map/Codec-Argumente)."""
+        if copy_video:
+            return ["-i", c.path], ["-map", "0:v:0", "-c:v", "copy"]
+        W, H = (c.width, c.height) if full_v else (o["width"], o["height"])
+        rate = c.fps_str if full_v else str(o["fps"])
+        oo = dict(o)
+        if full_v:
+            full_quality_settings(oo, c)
+        vf = f"fps={rate}"
+        if not full_v:
+            vf += (f",scale={W}:{H}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+                   f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black,setsar=1")
+        k, fs, small, mg = overlay.sizes(H)
+        texts = (overlay.text(c.path.name, fs, mg, f"h-th-{mg}-{int(fs * 1.6)}")
+                 + overlay.text(overlay.tc(0), fs, mg, f"h-th-{mg}", expand=True))
+        # pro Tonquelle die jeweils laufende Datei + Position darin (wechselt z.B. alle 30 min bei DJI)
+        for i, s in enumerate(audio_srcs):
+            x, y = overlay.audio_pos(i, mg, small, W)
+            parts = [a for a in clips[s.key] if a.end > c.start and a.start < c.end]
+            if not parts:
+                texts += overlay.text(f"{s.name}: -", small, x, y)
+            for a in parts:
+                t_a = max(0.0, (a.start - c.start) / (1 + c.drift))
+                t_b = (a.end - c.start) / (1 + c.drift)
+                en = f"between(t,{t_a:.3f},{t_b:.3f})"
+                texts += overlay.text(f"{s.name}: {a.path.name}", small, x, y, enable=en)
+                texts += overlay.text(overlay.tc(a.local(c.start)), small, x, int(y + small * 1.6),
+                                      expand=True, enable=en)
+        return [*hw_in, "-i", c.path], ["-filter_complex", f"[0:v]{vf}{texts}[v]", "-map", "[v]",
+                                        *vcodec_args(oo)]
+
+    def work(c):
+        dur = c.duration
+        n = int(round(dur * sr))
+        inputs, graphs, labels, names = [], [], [], []
+        mono = ",aformat=channel_layouts=mono"
+        cam_lay = ",aformat=channel_layouts=" + ("stereo" if full_a and c.channels >= 2 else "mono")
+        for i, s in enumerate(audio_srcs):
+            # Ton der Timeline ab Clipstart; Drift: Timeline-Länge auf Clip-Länge strecken
+            inputs += ["-ss", f"{c.start:.6f}", "-t", f"{dur * (1 + c.drift) + 1:.6f}", "-i", final[s.key]]
+            graphs.append(f"[{i + 1}:a]asetrate={sr * (1 + c.drift):.6f},aresample={sr},asetpts=N/SR/TB,"
+                          f"apad,atrim=end_sample={n}{mono}[t{i}]")
+            labels.append(f"[t{i}]")
+            names.append(s.name)
+        if not args.only_new_audio and c.has_audio:
+            proc = f"{chain}," if chain else ""
+            graphs.append(f"[0:a:0]{proc}aresample={sr},asetpts=N/SR/TB,apad,atrim=end_sample={n}{cam_lay}[cam]")
+            labels.append("[cam]")
+            names.append(f"{video_src.name} (Kamera)")
+        nch = len(labels)
+        if o["audio_tracks"] == "single":
+            if nch > 1:
+                graphs.append("".join(labels) + f"amerge=inputs={nch}[aout]")
+            else:
+                graphs[-1] = graphs[-1].rsplit("[", 1)[0] + "[aout]"
+            amaps = ["-map", "[aout]"]
+            chs = [1] * len(audio_srcs) + ([2 if "stereo" in cam_lay else 1] if len(names) > len(audio_srcs) else [])
+            meta = ["-metadata:s:a:0", "title=" + channel_labels(names, chs)]
+            acodec = audio_out_args(nch, full_a, o)
+        else:
+            amaps = [x for lb in labels for x in ("-map", lb)]
+            meta = [x for i, nm in enumerate(names) for x in (f"-metadata:s:a:{i}", f"title={nm}")]
+            acodec = audio_out_args(1, full_a, o)
+        out = out_path(c)
+        part = out.with_name(out.stem + ".part.mov")
+
+        def attempt(hw_in):
+            vin, vmap = video_args(c, hw_in)
+            agraph = ";".join(graphs)
+            if "-filter_complex" in vmap:
+                j = vmap.index("-filter_complex")
+                vmap = vmap[:j + 1] + [vmap[j + 1] + ";" + agraph] + vmap[j + 2:]
+                fc = []
+            else:
+                fc = ["-filter_complex", agraph]
+            run(["ffmpeg", "-y", "-v", "error", *vin, *inputs, *fc, *vmap, *amaps, *acodec, *meta,
+                 "-map_metadata", "0", "-t", f"{dur:.6f}", part])
+
+        if hwargs and not copy_video:
+            try:
+                attempt(hwargs)
+            except FFmpegError as e:
+                time.sleep(0.5)
+                if ABORT.is_set() or e.returncode < 0:
+                    raise
+                print(f"  ! Hardware-Decoding fehlgeschlagen bei {c.path.name} – wiederhole mit Software-Decoding")
+                attempt([])
+        else:
+            attempt([])
+        os.replace(part, out)
+        with plock:
+            manifest[signature(c)] = out.name
+            save_json(mfile, manifest)
+            done["n"] += 1
+            done["dur"] += dur
+            el = time.time() - t_start
+            frac = done["dur"] / max(todo_dur, 1e-6)
+            eta = el / frac - el if frac > 0 else 0
+            print(f"  [{done['n']}/{len(todo)}] {out.name}  ({hms(dur, False)}, Tempo {done['dur'] / max(el, 1e-6):.1f}x,"
+                  f" Rest ca. {hms(eta, False)})")
+
+    run_parallel(jobs, todo, work)
+    names = [s.name for s in audio_srcs] + ([] if args.only_new_audio else [f"{video_src.name} (Kamera)"])
+    cam_c = 2 if full_a and max(c.channels for c in vclips) >= 2 else 1
+    chs = [1] * len(audio_srcs) + ([] if args.only_new_audio else [cam_c])
+    print(f"\nFertig: {len(vclips)} Dateien in {out_dir}\n  Tonkanäle: " + channel_labels(names, chs))
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        sys.exit(130)                # Strg+C: Hinweis zum Fortsetzen steht schon da, kein Traceback
+        sys.exit(130)

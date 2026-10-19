@@ -136,18 +136,13 @@ _im_setup() {
   else
     _im_warn "keine config.json – es gelten die Standardwerte (Zeitzone = Rechner-Zeitzone!)"
   fi
-  for d in lav_interviewer lav_befragter sony gopro; do
-    if [ -d "$_im_dir/$d" ]; then
-      _im_ok "Ordner $d  ($(find "$_im_dir/$d" -maxdepth 1 -type f ! -name '.*' | wc -l | tr -d ' ') Dateien)"
-    else
-      _im_warn "Ordner $d fehlt"
-    fi
-  done
 
   echo
   echo "Fertig. In diesem Terminal kannst du jetzt starten:"
-  echo "  python3 interview_merge.py . --dry-run    # Zeiten prüfen"
-  echo "  python3 interview_merge.py .              # rendern"
+  echo "  python3 interview_merge.py merge --audio LAV1 --audio LAV2 --video KAMERA [--pip KAMERA2] -o AUSGABE"
+  echo "  python3 interview_merge.py sync-to-audio --audio LAV1 --video KAMERA -o AUSGABE"
+  echo "  python3 interview_merge.py sync-to-video --audio LAV1 --video KAMERA -o AUSGABE"
+  echo "  Hilfe: python3 interview_merge.py -h"
   return 0
 }
 

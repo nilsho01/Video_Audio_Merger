@@ -1,20 +1,22 @@
 {
   "timezone": "Europe/Berlin",
-  "folders": {
-    "lav_interviewer": "lav_interviewer",
-    "lav_befragter": "lav_befragter",
-    "sony": "sony",
-    "gopro": "gopro"
+  "defaults": {
+    "audio": {
+      "offset_s": 0.0,
+      "tags_are_utc": true
+    },
+    "video": {
+      "offset_s": 0.0,
+      "tags_are_utc": true,
+      "use_timecode": false
+    }
   },
-  "track_names": {
-    "lav_interviewer": "Lav Interviewer",
-    "lav_befragter": "Lav Befragter",
-    "sony": "Sony Kamera-Ton",
-    "gopro": "GoPro-Ton"
+  "sources": {
+    "gopro": {
+      "tags_are_utc": true
+    }
   },
   "output": {
-    "file": "interview_merged.mov",
-    "dir": null,
     "width": 1920,
     "height": 1080,
     "fps": 25,
@@ -25,34 +27,8 @@
     "hwaccel": "auto",
     "jobs": "auto",
     "audio_rate": 48000,
-    "audio_codec": "aac",
-    "audio_tracks": "single",
-    "aac_single": "384k",
-    "aac_mono": "96k",
-    "aac_stereo": "160k"
-  },
-  "sources": {
-    "lav_interviewer": {
-      "offset_s": 0.0,
-      "tags_are_utc": true,
-      "channels": "mono"
-    },
-    "lav_befragter": {
-      "offset_s": 0.0,
-      "tags_are_utc": true,
-      "channels": "mono"
-    },
-    "sony": {
-      "offset_s": 0.0,
-      "tags_are_utc": true,
-      "channels": "mono",
-      "use_timecode": false
-    },
-    "gopro": {
-      "offset_s": 0.0,
-      "tags_are_utc": true,
-      "channels": "mono"
-    }
+    "aac_per_channel": "96k",
+    "audio_tracks": "single"
   },
   "join_tolerance_s": 3.0,
   "cut_gaps": {
@@ -62,12 +38,6 @@
   },
   "audio_processing": {
     "enabled": true,
-    "apply_to": [
-      "lav_interviewer",
-      "lav_befragter",
-      "sony",
-      "gopro"
-    ],
     "highpass_hz": 90,
     "denoise": "afftdn",
     "denoise_db": 12,
@@ -86,7 +56,7 @@
   },
   "audio_sync": {
     "enabled": true,
-    "lav_to_lav": true,
+    "audio_to_audio": true,
     "coarse": true,
     "coarse_min_ratio": 1.5,
     "coarse_min_overlap_s": 120,

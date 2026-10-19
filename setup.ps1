@@ -172,21 +172,12 @@ function _im_setup {
     else { _im_err "interview_merge.py nicht im Ordner $dir" }
     if (Test-Path (Join-Path $dir 'config.json')) { _im_ok "config.json" }
     else { _im_warn "keine config.json - es gelten die Standardwerte (Zeitzone = Rechner-Zeitzone!)" }
-    foreach ($d in 'lav_interviewer', 'lav_befragter', 'sony', 'gopro') {
-        $p = Join-Path $dir $d
-        if (Test-Path $p -PathType Container) {
-            $n = @(Get-ChildItem $p -File | Where-Object { -not $_.Name.StartsWith('.') }).Count
-            _im_ok "Ordner $d  ($n Dateien)"
-        } else {
-            _im_warn "Ordner $d fehlt (ok, wenn das Material woanders liegt)"
-        }
-    }
 
     Write-Host ""
     Write-Host "Fertig. In diesem Fenster kannst du jetzt starten:"
-    Write-Host "  python interview_merge.py . --dry-run    # Zeiten pruefen"
-    Write-Host "  python interview_merge.py .              # rendern"
-    Write-Host '  python interview_merge.py "E:\Porsche\Interview 1" -o "E:\Export" -n "Interview 1"'
+    Write-Host '  python interview_merge.py merge --audio "E:\Interview 1\lav1" --audio "E:\Interview 1\lav2" --video "E:\Interview 1\sony" -o "E:\Export"'
+    Write-Host '  python interview_merge.py sync-to-video --audio "E:\Interview 1\lav1" --video "E:\Interview 1\sony" -o "E:\Export"'
+    Write-Host '  Hilfe: python interview_merge.py -h'
     return $true
 }
 

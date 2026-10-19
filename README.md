@@ -1,30 +1,14 @@
-# interview_merge.py
+# Video_Audio_Merger (`interview_merge.py`)
 
-Baut aus mehreren Aufnahmegeräten eines Interviews automatisch **ein durchgehendes, synchrones Video** – gedacht als Sichtungs- und Transkriptionsgrundlage.
+Synchronisiert automatisch **beliebig viele Tonaufnahmen** (z.B. DJI-Mic-Lavs, Recorder) mit **Kameraclips** (z.B. Sony, GoPro) – auch wenn die Geräte-Uhren falsch gehen, in einer anderen Zeitzone stehen oder leicht unterschiedlich schnell laufen.
 
-Quellen:
+Drei Modi:
 
-- **Lav Interviewer** – DJI Mic 2 (WAV)
-- **Lav Befragter** – DJI Mic 2 (WAV)
-- **Sony** – Kameraclips mit Ton (MP4 + XML-Sidecar)
-- **GoPro** – Kameraclips mit Ton (MP4, Kapitel)
-
-Ergebnis ist eine einzige `.mov`-Datei mit Bild, allen Tonquellen als getrennten Kanälen und eingeblendeten Dateinamen und Timecodes.
-
----
-
-## Was das Skript macht
-
-1. **Startzeiten erkennen** für jede Datei, aus Sony-XML, Broadcast-WAV-Metadaten, `creation_time`, der Uhrzeit im Dateinamen oder notfalls dem Dateidatum.
-2. **Geteilte Dateien zusammensetzen.** DJI-Mic-Aufnahmen, die automatisch in 30-Minuten-Stücke geteilt wurden, werden lückenlos aneinandergehängt. GoPro-Kapitel (`GX01…`, `GX02…`) ebenso.
-3. **Über den Ton synchronisieren:**
-   - Lav 2 wird auf Lav 1 abgeglichen, über das Übersprechen zwischen den Mikros.
-   - **Grobsuche:** Die komplette Aufnahme jeder Kamera wird gegen die kompletten Lavs abgeglichen. Das findet auch Uhrzeitfehler von Minuten oder Stunden, etwa falsche Zeitzone oder eine falsch gestellte Kamera-Uhr.
-   - **Mittlere Suche:** Ist die Grobsuche nicht eindeutig (typisch bei leisem, verrauschtem GoPro-Ton), werden mehrere 60-Sekunden-Ausschnitte als echte Wellenform mit den Lavs verglichen, ±5 Minuten um die Kamera-Uhrzeit und um die Kandidaten der Grobsuche. Übernommen wird nur, wenn mehrere Ausschnitte unabhängig auf denselben Versatz kommen.
-   - **Feinsuche:** Jeder Clip wird an mehreren Stellen auf Millisekunden genau abgeglichen. Dabei wird auch die **Drift** gemessen und korrigiert, also dass Geräte-Uhren minimal unterschiedlich schnell laufen.
-4. **Pausen herausschneiden,** in denen weder Bild noch Ton aufgenommen wurde.
-5. **Ton für Transkription aufbereiten:** Hochpass gegen Rumpeln und Brummen, Rauschunterdrückung und dynamische Lautstärkeanpassung, damit leise und laute Sprecher gleich laut sind. Das passiert erst nach dem Sync und beeinflusst ihn nicht.
-6. **Rendern.** Je nach Situation ist Sony vollformatig, GoPro vollformatig, GoPro als Bild-im-Bild über der Sony, oder Schwarzbild. Dazu kommen alle Einblendungen.
+| Modus | Ergebnis |
+|---|---|
+| `merge` | **Ein** durchgehendes Video: Hauptkamera vollformatig, optional eine zweite Kamera als Bild-im-Bild, Schwarzbild wo keine Kamera lief. Alle Tonquellen als getrennte Kanäle. |
+| `sync-to-audio` | Wie `merge`, aber mit **genau einer** Kamera. Die Zeitachse richtet sich nach dem Ton; Lücken ohne Bild sind schwarz. |
+| `sync-to-video` | **Pro Kameraclip eine Datei** mit allen dazu synchronen Tonspuren. Nur Zeiten mit Bild, kein Schwarzbild. Ideal zum Weiterschneiden. |
 
 ---
 
@@ -32,377 +16,299 @@ Ergebnis ist eine einzige `.mov`-Datei mit Bild, allen Tonquellen als getrennten
 
 ### macOS
 
-In jedem neuen Terminal, im Projektordner:
+In jedem neuen Terminal, im Ordner mit dem Skript:
 
 ```bash
 source setup.sh
-python3 interview_merge.py . --dry-run    # Zeiten prüfen
-python3 interview_merge.py .              # rendern
+python3 interview_merge.py merge \
+    --audio Interviewer=/Volumes/Platte/US_01/lav_interviewer \
+    --audio Gast=/Volumes/Platte/US_01/lav_befragter \
+    --video /Volumes/Platte/US_01/sony \
+    --pip /Volumes/Platte/US_01/gopro \
+    -o /Volumes/Export/US_01 -n US_01_MERGED
 ```
 
-`setup.sh` prüft und installiert bei Bedarf alles Nötige: Homebrew-Check, `ffmpeg-full`, Python-Umgebung `.venv` mit numpy und Zeitzonendaten. Danach setzt es PATH und Umgebung für **dieses** Terminalfenster und zeigt, welche Quellordner gefunden wurden. Es muss mit `source` gestartet werden, sonst gelten die Einstellungen nicht im Terminal.
-
-Die Abschnitte unter „Installation von Hand (macOS)“ beschreiben, was `setup.sh` macht, falls du es von Hand einrichten willst.
+`setup.sh` prüft und installiert bei Bedarf alles Nötige (Homebrew-Check, `ffmpeg-full`, Python-Umgebung `.venv` mit numpy und Zeitzonendaten) und setzt PATH und Umgebung für **dieses** Terminalfenster. Es muss mit `source` gestartet werden.
 
 ### Windows (Eingabeaufforderung / cmd)
 
-In jedem neuen **cmd**-Fenster, im Projektordner:
-
 ```bat
 setup
-python interview_merge.py . --dry-run    # Zeiten prüfen
-python interview_merge.py .              # rendern
+python interview_merge.py sync-to-video --audio "E:\US_01\lav1" --audio "E:\US_01\lav2" --video "E:\US_01\sony" -o "E:\Export"
 ```
 
-`setup.bat` macht dasselbe wie die PowerShell-Variante unten, braucht aber keine Freigabe für Skripte. **Nicht per Doppelklick starten**: Dann öffnet sich ein eigenes Fenster, das sich danach schließt, und die Einstellungen sind weg.
-
-cmd im Projektordner öffnen: im Explorer in die Adresszeile `cmd` tippen und Enter drücken.
+`setup.bat` installiert per `winget` ffmpeg (Gyan-Build) und bei Bedarf Python, legt `.venv` mit numpy und tzdata an und aktiviert sie. **Nicht per Doppelklick starten**, sonst schließt sich das Fenster und die Einstellungen sind weg. cmd im richtigen Ordner öffnen: im Explorer in die Adresszeile `cmd` tippen.
 
 ### Windows (PowerShell)
 
-In jedem neuen **PowerShell**-Fenster, im Projektordner:
-
 ```powershell
 . .\setup.ps1
-python interview_merge.py . --dry-run    # Zeiten prüfen
-python interview_merge.py .              # rendern
+python interview_merge.py merge --audio "E:\US_01\lav1" --video "E:\US_01\sony" -o "E:\Export"
 ```
 
-Wichtig ist der **Punkt mit Leerzeichen** vor `.\setup.ps1`. Nur so gelten PATH und Python-Umgebung danach im Fenster.
+Wichtig ist der **Punkt mit Leerzeichen** vor `.\setup.ps1`. Einmalig vorab, falls Skripte blockiert sind: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` (bei heruntergeladener Datei zusätzlich `Unblock-File .\setup.ps1`).
 
-`setup.ps1` installiert bei Bedarf über `winget`:
-- **ffmpeg** (Gyan-Build `Gyan.FFmpeg`, enthält Texte/drawtext, x265 und die Tonfilter)
-- **Python 3.12**, falls kein Python 3.9+ vorhanden ist
-- die Python-Umgebung `.venv` mit numpy und tzdata (Zeitzonendaten, die Windows-Python sonst fehlen)
-
-Danach zeigt es, welche Quellordner gefunden wurden und welche Hardware-Encoder ffmpeg kennt.
-
-**Einmalig vorab**, falls PowerShell meldet, dass Skripte deaktiviert sind:
-
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-```
-
-Hast du `setup.ps1` aus dem Internet heruntergeladen statt per Git geholt, blockiert Windows es zusätzlich. Dann einmal `Unblock-File .\setup.ps1` ausführen.
-
-**Unterschiede zu macOS:**
-- Der Befehl heißt `python` statt `python3`.
-- Pfade schreibst du wie gewohnt mit Laufwerksbuchstaben, in Anführungszeichen, wenn Leerzeichen vorkommen: `python interview_merge.py "E:\Porsche\Interview 1" -o "E:\Export" -n "Interview 1"`.
-- Statt `hevc_videotoolbox` gibt es schnelle Hardware-Encoder je nach Grafikkarte: `"vcodec": "hevc_nvenc"` (NVIDIA), `"hevc_qsv"` (Intel) oder `"hevc_amf"` (AMD). Die Bitrate stellst du über `"bitrate"` ein.
-
-## Installation von Hand (macOS)
-
-### 1. ffmpeg mit Textfunktion
-
-Das Standard-`ffmpeg` von Homebrew kann keine Texte einblenden. Du brauchst `ffmpeg-full`:
-
-```bash
-brew install ffmpeg-full
-```
-
-`ffmpeg-full` ist „keg-only“, muss also in den PATH. Dauerhaft geht das so:
-
-```bash
-echo 'export PATH="$(brew --prefix ffmpeg-full)/bin:$PATH"' >> ~/.zshrc
-```
-
-Danach Terminal neu öffnen. Prüfen:
-
-```bash
-ffmpeg -hide_banner -filters | grep drawtext
-```
-
-Es muss eine Zeile mit `drawtext` erscheinen.
-
-> Falls danach ein anderes ffmpeg mit `Library not loaded` abbricht: `brew reinstall ffmpeg`.
-
-### 2. Python-Umgebung mit numpy
-
-numpy wird für den Audio-Sync gebraucht. Einmalig im Projektordner:
-
-```bash
-cd ~/Programming/Vodeo-Transcript-Creator
-python3 -m venv .venv
-source .venv/bin/activate
-pip install numpy
-```
-
-Bei jedem neuen Terminal vor dem Start:
-
-```bash
-source .venv/bin/activate
-```
+Unter Windows heißt der Befehl `python` statt `python3`. Als schnelle Hardware-Encoder gibt es dort je nach Grafikkarte `hevc_nvenc` (NVIDIA), `hevc_qsv` (Intel) oder `hevc_amf` (AMD); `"vcodec": "auto"` wählt automatisch.
 
 ---
 
-## Ordnerstruktur
+## Aufruf
 
 ```
-projekt/
-├── interview_merge.py
-├── setup.sh                 macOS: Terminal vorbereiten (source setup.sh)
-├── setup.ps1                Windows: PowerShell vorbereiten (. .\setup.ps1)
-├── setup.bat                Windows: cmd vorbereiten (setup)
-├── config.json              (optional, aber empfohlen)
-├── lav_interviewer/         DJI Mic 2 – Interviewer
-├── lav_befragter/           DJI Mic 2 – Befragte*r
-├── sony/                    Sony-Clips (.MP4 + ...M01.XML)
-└── gopro/                   GoPro-Clips (.MP4)
+python3 interview_merge.py MODUS --audio [NAME=]PFAD [--audio ...] --video [NAME=]PFAD [--pip [NAME=]PFAD] [Optionen]
 ```
 
-- Die Sony-XML-Dateien (`C0016M01.XML`) **mitkopieren**. Sie enthalten die genaueste Startzeit inklusive Zeitzone.
-- `.LRV`- und `.THM`-Dateien der GoPro werden automatisch ignoriert.
-- **Versehentliche Aufnahmen** gehören nicht in die Ordner, z.B. ein 18-Sekunden-Clip beim Einpacken Stunden später. Sie verlängern sonst die Timeline.
-- Fehlt ein Ordner, bleibt die entsprechende Spur einfach leer bzw. stumm.
+| Angabe | Bedeutung |
+|---|---|
+| `MODUS` | `merge`, `sync-to-audio` oder `sync-to-video` |
+| `--audio [NAME=]PFAD` | Ordner (oder einzelne Datei) mit Tonaufnahmen. **Beliebig oft.** Der **erste** ist die Referenz, auf die alles synchronisiert wird. |
+| `--video [NAME=]PFAD` | Ordner (oder Datei) der Kamera. Pflicht, genau einer. |
+| `--pip [NAME=]PFAD` | Nur `merge`: zweite Kamera, erscheint als Bild-im-Bild, wenn beide laufen (sonst vollformatig). |
 
----
+`NAME=` ist optional und gibt der Quelle einen Anzeigenamen für Tonkanäle, Einblendungen und Report, z.B. `--audio Interviewer=/pfad/lav1`. Ohne Namen gilt der Ordnername.
 
-## Benutzung
-
-```bash
-source .venv/bin/activate
-python3 interview_merge.py .                # rendern (Projekt = aktueller Ordner)
-python3 interview_merge.py . --dry-run      # nur Zeiten + Timeline anzeigen, nichts rendern
-python3 interview_merge.py /pfad/projekt    # anderes Projekt
-```
+### Optionen
 
 | Option | Wirkung |
 |---|---|
-| `--dry-run` | Erkennt Zeiten, zeigt Timeline und Schnitte. Kein Sync, kein Rendern, dauert Sekunden. |
-| `--no-sync` | Kein Audio-Sync. Clips liegen nur nach erkannter Uhrzeit. |
-| `--no-cut` | Pausen ohne Bild und Ton **nicht** herausschneiden. |
-| `--config PFAD` | Andere Config-Datei verwenden (Standard: `projekt/config.json`). |
-| `--raw-audio` | Ton **nicht** aufbereiten, Originalpegel behalten. |
-| `-n NAME`, `--name NAME` | Dateiname des Videos, z.B. `-n interview_kim`. Endung `.mov` wird ergänzt, falls sie fehlt. Der Report heißt dann `interview_kim_report.txt`. Standard: `output.file` aus der Config. |
-| `-o PFAD`, `--output PFAD` | Ausgabeordner für Video, Report und Zwischendateien. Wird angelegt, falls er fehlt. Standard: Projektordner. |
-| `--fresh` | Zwischenstand eines abgebrochenen Laufs ignorieren und komplett neu rendern. |
-| `--keep-temp` | Zwischendateien (WAVs, Segmente) nicht löschen, zur Fehlersuche. |
+| `--info` | Dateinamen und Timecodes einblenden (sonst sauberes Bild ohne Text). |
+| `--only_new_audio` | Kameraton weglassen. Er wird intern trotzdem zum Synchronisieren benutzt. |
+| `--full_quality_video` | Originalauflösung und -bildrate der Kamera, hohe Bitrate. Bei `sync-to-video` **ohne** `--info` wird das Bild sogar **bitgenau unverändert** kopiert (keine Neukodierung, sehr schnell). |
+| `--full_quality_audio` | Ton **unbearbeitet** als PCM (24 bit), ohne Rauschunterdrückung und Lautstärkeanpassung; Kameraton bleibt Stereo. |
+| `-o PFAD` | Ausgabeordner (wird angelegt). Standard: der Ordner über dem Kameraordner. |
+| `-n NAME` | Name des Videos (`merge`, `sync-to-audio`). Bei `sync-to-video` Präfix vor jedem Dateinamen. |
+| `--dry-run` | Nur Dateien und Zeiten erkennen und anzeigen, nichts rendern. Dauert Sekunden. |
+| `--fresh` | Zwischenstand eines abgebrochenen Laufs ignorieren und komplett neu rechnen. |
+| `--config PFAD` | Andere `config.json` verwenden (Standard: die neben dem Skript). |
 
-**Empfohlener Ablauf:** Erst `--dry-run` und prüfen, ob die Uhrzeiten grob plausibel sind. Danach richtig rendern.
+Ohne die beiden `--full_quality_*`-Optionen ist das Ergebnis auf Sichtung und Transkription ausgelegt: 1080p, H.265 per Hardware, Ton aufbereitet (Hochpass, Rauschunterdrückung, Lautstärkeangleich) als AAC.
+
+### Beispiele
+
+```bash
+# Ein Video mit beiden Kameras, zum Sichten/Transkribieren, mit Einblendungen
+python3 interview_merge.py merge --audio lav1 --audio lav2 --video sony --pip gopro -o export -n Interview --info
+
+# Ein Video aus einer Kamera, nur Lav-Ton
+python3 interview_merge.py sync-to-audio --audio lav1 --audio lav2 --video sony -o export --only_new_audio
+
+# Jeden Sony-Clip mit synchronem Lav-Ton, Bild unverändert, Ton unbearbeitet – zum Schneiden
+python3 interview_merge.py sync-to-video --audio lav1 --audio lav2 --video sony -o export \
+    --full_quality_video --full_quality_audio
+```
 
 ---
 
-## Abbrechen und Fortsetzen
+## Was das Skript macht
 
-Jeder Lauf arbeitet in einem festen Ordner `imerge_<Name des Videos>` im Ausgabeordner. Wird der Lauf unterbrochen (Strg+C, Terminal geschlossen, Ruhezustand, Platte getrennt), bleibt dieser Ordner liegen. **Denselben Befehl nochmal starten** genügt: Bereits fertige Segmente werden übernommen, nur der Rest wird gerendert.
+1. **Startzeiten erkennen** für jede Datei: Sony-XML, Broadcast-WAV-Metadaten, `creation_time`, Uhrzeit im Dateinamen oder notfalls das Dateidatum.
+2. **Geteilte Dateien zusammensetzen.** Tonaufnahmen, die automatisch geteilt wurden (DJI Mic 2 alle 30 Minuten), werden lückenlos aneinandergehängt; GoPro-Kapitel (`GX01…`, `GX02…`) ebenso.
+3. **Über den Ton synchronisieren**, jeweils gegen die Referenz (erster `--audio`-Ordner):
+   - **Grobsuche:** Die komplette Aufnahme einer Quelle wird gegen die komplette Referenz abgeglichen. Findet auch Uhrzeitfehler von Minuten oder Stunden.
+   - **Mittlere Suche:** Ist die Grobsuche nicht eindeutig (typisch bei leisem, verrauschtem GoPro-Ton), werden mehrere 60-Sekunden-Ausschnitte als Wellenform verglichen. Übernommen wird nur, wenn mehrere Ausschnitte unabhängig übereinstimmen.
+   - **Feinsuche:** Jeder Clip wird an mehreren Stellen auf Millisekunden genau abgeglichen, inklusive **Drift** (Uhren laufen minimal unterschiedlich schnell). Widersprüchliche Messungen werden verworfen.
+   - Weitere Tonquellen werden genauso auf die Referenz synchronisiert, danach alle Kameras auf die Summe aller Tonquellen.
+4. **Pausen herausschneiden** (`merge`, `sync-to-audio`), in denen weder Bild noch Ton aufgenommen wurde.
+5. **Ton aufbereiten** für Transkription (außer bei `--full_quality_audio`).
+6. **Rendern** bzw. bei `sync-to-video` pro Clip die Datei bauen; der Ton wird dabei drift-genau auf die Clip-Länge gestreckt.
 
-```
-Fortsetzen: 87/200 Segmente schon fertig (41%), rendere die restlichen 113
-```
-
-- Jedes Segment hat einen Fingerabdruck aus Zeitbereich, Quellclips, Positionen, Einblendungen und Encoder-Einstellungen. Hat sich etwas geändert (andere Config, anderer Sync), wird das betroffene Segment neu gerendert, der Rest bleibt.
-- Halb geschriebene Segmente (`.part.mov`) werden nie übernommen.
-- Auch Analyse, Sync, Lav- und Kamera-Tonspuren und die Tonaufbereitung werden gespeichert und beim Fortsetzen übernommen, solange Quelldateien (Größe, Änderungsdatum) und die dafür relevanten Einstellungen gleich sind. Ändert sich etwas davon, läuft die Analyse automatisch neu.
-- Nach erfolgreichem Abschluss wird der Arbeitsordner gelöscht.
-- **Abbrüche der Vorversion** (Ordner `imerge_` mit Zufallsnamen) werden ebenfalls erkannt. Weil die alte Version keine Fingerabdrücke gespeichert hat, wird nur ein lückenloser Anfang übernommen, dessen Segmentlängen exakt zum neuen Plan passen. Liefen diese Segmente mit x265 und wären sie weniger als 75 % des Videos, wird stattdessen mit dem schnelleren Hardware-Encoder komplett neu gerendert.
+---
 
 ## Ergebnis
 
-### Datei
+### Dateien
 
-- `interview_merged.mov`: das Video
-- `interview_merge_report.txt`: Report mit allen Dateien, erkannten Zeiten und Sync-Korrekturen
-
-### Bild
-
-| Situation | Darstellung |
+| Modus | Dateien im Ausgabeordner |
 |---|---|
-| Nur Sony läuft | Sony vollformatig |
-| Nur GoPro läuft | GoPro vollformatig |
-| Beide laufen | Sony vollformatig, GoPro klein unten rechts |
-| Keine Kamera, aber Ton | Schwarz, „kein Videomaterial“ |
-| Herausgeschnittene Pause | 2 s Schwarz mit Uhrzeit und Länge der Pause |
-
-### Einblendungen
-
-```
-+-----------------------------------------------------------------+
-| Lav Interviewer: DJI_…   00:41:12.480    Lav Befragter: DJI_…   |
-| 00:12:34.567                                    00:12:30.120    |
-|                                                                 |
-|                                             +---------------+   |
-| C0016.MP4                                   | GX030055.MP4  |   |
-| 00:33:50.120                                | 00:05:12.000  |   |
-+---------------------------------------------+---------------+---+
-```
-
-- **Oben mittig:** Position im fertigen Video. Sie passt zum Player und fürs Transkript.
-- **Oben links/rechts:** Lav-Datei und Position **in dieser Originaldatei**.
-- **Unten links:** Kameradatei und Position im Clip.
-- **Bild-im-Bild:** GoPro-Datei und Position im Clip.
-
-Über die Positionen findest du jede Stelle direkt im Originalmaterial wieder.
+| `merge`, `sync-to-audio` | `NAME.mov` und `NAME_report.txt` |
+| `sync-to-video` | pro Clip `[NAME_]CLIP_synced.mov` (z.B. `C0047_synced.mov`) und ein Report |
 
 ### Ton
 
-Standard (`"audio_tracks": "single"`): **eine Tonspur mit 4 Kanälen**.
+Standard (`"audio_tracks": "single"`): **eine Tonspur mit mehreren Kanälen**, in dieser Reihenfolge:
 
-| Kanal | Inhalt |
+1. die `--audio`-Quellen in der Reihenfolge des Aufrufs
+2. der Kameraton (`--video`, dann `--pip`), außer bei `--only_new_audio`
+
+Die Belegung steht am Ende der Ausgabe, z.B. `Tonkanäle: 1 Interviewer | 2 Gast | 3–4 sony | 5–6 gopro`. Mono pro Quelle; mit `--full_quality_audio` bleibt Kameraton Stereo (zwei Kanäle).
+
+### Bild (`merge` / `sync-to-audio`)
+
+| Situation | Darstellung |
 |---|---|
-| 1 | Lav Interviewer |
-| 2 | Lav Befragter |
-| 3 | Sony-Kameraton |
-| 4 | GoPro-Kameraton |
+| Nur Hauptkamera läuft | vollformatig |
+| Nur Bild-im-Bild-Kamera läuft | vollformatig |
+| Beide laufen | Hauptkamera vollformatig, zweite klein unten rechts |
+| Keine Kamera, aber Ton | schwarz |
+| Herausgeschnittene Pause | 2 s schwarz |
+
+### Einblendungen (`--info`)
+
+- **Oben mittig:** Position im fertigen Video (nicht bei `sync-to-video`).
+- **Oben links/rechts, weitere darunter:** pro Tonquelle die gerade laufende Datei und die Position **in dieser Originaldatei**. Wechselt die Datei (DJI-Split), wechselt auch die Anzeige.
+- **Unten links:** Kameradatei und Position im Clip; im Bild-im-Bild entsprechend.
+- Schwarzbild: „kein Videomaterial“ bzw. „Pause herausgeschnitten“ mit Uhrzeit und Länge.
 
 ---
 
 ## In DaVinci Resolve importieren
 
-Resolve liest mehrere separate Tonspuren aus ffmpeg-Dateien oft nicht vollständig. Deshalb gibt es standardmäßig eine Spur mit 4 Kanälen. So bekommst du 4 einzelne Spuren:
+Resolve liest mehrere separate Tonspuren aus ffmpeg-Dateien oft nicht vollständig. Deshalb gibt es standardmäßig eine Spur mit mehreren Kanälen. So bekommst du einzelne Spuren:
 
 1. Datei in den Media Pool importieren, **noch nicht** in eine Timeline ziehen.
 2. Rechtsklick → *Clip Attributes* → Tab *Audio*.
-3. Oben *Format: Mono*, *Tracks: 4*, **Add**, falls noch nicht 4 Zeilen da sind.
+3. Oben *Format: Mono*, *Tracks* = Anzahl der Kanäle, **Add**.
 4. Zeile 1 → Embedded Channel 1, Zeile 2 → Channel 2, usw.
 5. OK → Rechtsklick auf den Clip → *Create New Timeline Using Selected Clips*.
 
-> Änderungen in den Clip Attributes gelten nur für Clips, die **danach** in eine Timeline gezogen werden. Clips, die schon in einer Timeline liegen, behalten die alte Belegung. Liegt der Clip bereits in einer Timeline, ist oben im Dialog alles ausgegraut.
+> Änderungen in den Clip Attributes gelten nur für Clips, die **danach** in eine Timeline gezogen werden. Liegt der Clip bereits in einer Timeline, ist oben im Dialog alles ausgegraut.
+
+---
+
+## Abbrechen und Fortsetzen
+
+Jeder Lauf arbeitet in einem festen Ordner `imerge_<Name>` im Ausgabeordner. Bei einem Abbruch (Strg+C, Terminal geschlossen, Ruhezustand, Platte getrennt) bleibt er liegen. **Denselben Befehl nochmal starten** genügt:
+
+- Analyse, Sync und Tonspuren werden übernommen, solange Quelldateien und Einstellungen gleich sind.
+- `merge`/`sync-to-audio`: Fertige Segmente werden übernommen (Fingerabdruck aus Zeitbereich, Clips, Positionen, Einblendungen, Encoder).
+- `sync-to-video`: Fertige Clip-Dateien werden übersprungen; ein halb fertiger Clip wird neu gebaut.
+- Halb geschriebene Dateien (`.part.mov`) werden nie übernommen. Nach erfolgreichem Abschluss wird der Arbeitsordner gelöscht.
+- Zweimal derselbe Befehl gleichzeitig wird verhindert (Sperrdatei).
+- Scheitert das Hardware-Decoding bei einem Clip, wird er automatisch per Software decodiert.
+
+Damit der Mac bei langen Läufen nicht schläft: `caffeinate -i python3 interview_merge.py …`
 
 ---
 
 ## Der Report
 
-Beispielzeile:
-
 ```
-C0016.MP4   18:44:31  @ 00:33:50.12  Dauer 01:12:18.24  [Sony-XML]  Grob -50.7s; Fein +0.213s, Drift +12 ppm (17 Messpunkte)
+C0047.MP4   18:44:31  @ 00:33:50.12  Dauer 00:46:49.92  [Sony-XML]  Grob -51.1s; Fein -0.325s, Drift -4 ppm (12 Messpunkte)
 ```
 
 | Teil | Bedeutung |
 |---|---|
 | `18:44:31` | Echte Uhrzeit des Clipstarts nach dem Sync |
-| `@ 00:33:50.12` | Position im fertigen Video |
+| `@ 00:33:50.12` | Position in der Timeline |
 | `[Sony-XML]` | Woher die ursprüngliche Startzeit kam |
-| `Grob -50.7s` | Uhrzeitfehler der ganzen Kamera (hier: Sony-Uhr 51 s vor) |
-| `Fein +0.213s` | Feinkorrektur dieses Clips |
-| `Drift +12 ppm` | Gangabweichung der Kamera-Uhr gegenüber den Lavs. Bis ca. ±100 ppm ist normal. |
-| `Messungen widersprüchlich` | Die Feinsuche hat an mehreren Stellen unterschiedliche Werte gefunden – meist liegt der Clip noch grob daneben. Wird nicht übernommen. |
-| `keine sichere Messung` | Ton nicht eindeutig zuordenbar, z.B. nur Wind oder Stille. Der Clip übernimmt den Mittelwert der anderen Clips derselben Kamera. |
+| `Grob -51.1s` | Uhrzeitfehler der ganzen Quelle (hier: Sony-Uhr 51 s vor) |
+| `Fein -0.325s` | Feinkorrektur dieses Clips |
+| `Drift -4 ppm` | Gangabweichung gegenüber der Referenz; bis ca. ±100 ppm normal |
+| `Messungen widersprüchlich` / `keine sichere Messung` | Ton nicht eindeutig zuordenbar; der Clip übernimmt den Median der anderen Clips derselben Quelle |
 
-Bei der Grobsuche steht in der Terminalausgabe pro Kamera:
+In der Terminalausgabe zeigt die Grobsuche pro Quelle Kandidaten und den **Abstand** (Eindeutigkeit). Ab `coarse_min_ratio` (1,5×) wird übernommen; sonst greift die mittlere Suche:
 
 ```
-Versatz +7200.0s (02:00:00.00), Treffer 0.45, Abstand 3.20x, Überlappung 00:22:00
+Mittlere Suche: Versatz -150.00s, 6 von 6 Ausschnitten stimmen überein
 ```
-
-**Abstand** ist die Eindeutigkeit, also wie viel besser der beste Treffer als der zweitbeste ist. Ab `coarse_min_ratio` (Standard 1,5×) wird der Versatz übernommen.
-
-Oben im Report stehen außerdem alle herausgeschnittenen Pausen mit Uhrzeit und Länge.
 
 ---
 
 ## Konfiguration (`config.json`)
 
-Die Datei liegt im Projektordner. Es müssen nur die Werte drinstehen, die vom Standard abweichen. Fehlende Werte nimmt das Skript aus seinen eingebauten Standards. Eine vollständige Beispiel-Config liegt bei.
+Liegt neben dem Skript. Es müssen nur abweichende Werte drinstehen.
 
 ### Zeitzone
 
 | Schlüssel | Standard | Bedeutung |
 |---|---|---|
-| `timezone` | `null` | Zeitzone, auf der die **Geräte-Uhren** laufen, z.B. `"Europe/Berlin"`. Zeitstempel mit Zonenangabe (Sony-XML, UTC-Tags) werden in diese Zone umgerechnet. Bei `null` gilt die Zeitzone des Rechners, und das geht schief, wenn der Rechner woanders steht als beim Dreh. |
+| `timezone` | `null` | Zeitzone der **Geräte-Uhren**, z.B. `"Europe/Berlin"`. Zeitstempel mit Zonenangabe werden darin umgerechnet. Bei `null` gilt die Zeitzone des Rechners – falsch, wenn der Rechner woanders steht als beim Dreh. |
 
-### `folders`
+### `defaults` und `sources`
 
-Namen der vier Unterordner, falls du sie anders nennen willst.
+`defaults.audio` gilt für alle `--audio`-Quellen, `defaults.video` für `--video`/`--pip`. Unter `sources` kann man einzelne Quellen über ihren Anzeigenamen (Ordnername oder `NAME=`) überschreiben, z.B.:
 
-### `track_names`
+```json
+"sources": { "gopro": { "offset_s": -3.0 } }
+```
 
-Bezeichnungen der Tonspuren bzw. Kanäle, auch für die Einblendungen der Lavs.
+| Schlüssel | Bedeutung |
+|---|---|
+| `offset_s` | Manuelle Korrektur in Sekunden (positiv = später). Für Fälle, in denen der automatische Sync nichts findet; auf wenige Sekunden genau reicht. |
+| `tags_are_utc` | `creation_time` ist echte UTC (`true`, Sony, die eingesetzte GoPro) oder nur Ortszeit mit falschem „Z“ (`false`). |
+| `use_timecode` | Nur Video: Uhrzeit aus dem Timecode nehmen (bei Time-of-Day-Timecode). |
 
 ### `output`
 
 | Schlüssel | Standard | Bedeutung |
 |---|---|---|
-| `file` | `interview_merged.mov` | Name der Ausgabedatei |
-| `dir` | `null` | Ausgabeordner (`null` = Projektordner). `--output` hat Vorrang. |
-| `width` / `height` | `1920` / `1080` | Auflösung. `1280` / `720` halbiert ungefähr die Dateigröße. |
-| `fps` | `25` | Bildrate der Ausgabe |
-| `vcodec` | `"auto"` | `"auto"`: schnellster funktionierender Hardware-Encoder (Mac: `hevc_videotoolbox`, Windows: `hevc_nvenc`/`hevc_qsv`/`hevc_amf`), sonst x265. Das Skript macht dazu vor dem Rendern einen kurzen Probelauf.<br>`"x265"`: Software, am kleinsten, aber deutlich langsamer<br>`"hevc_videotoolbox"`, `"hevc_nvenc"`, `"hevc_qsv"`, `"hevc_amf"`: Hardware fest wählen<br>`"libx264"`, `"h264_videotoolbox"`: H.264<br>`"prores"`: ProRes Proxy, groß, ideal zum Weiterschneiden |
-| `crf` | `null` | Qualität bei x265/x264. `null` = Standard (x265: 28, x264: 23). Höher heißt kleiner und schlechter; ab ca. 32 sichtbar. |
-| `preset` | `"fast"` | Encoder-Geschwindigkeit bei x265/x264: `ultrafast` … `slow`. Langsamer heißt kleiner. |
-| `hwaccel` | `"auto"` | Quellvideos per Hardware decodieren (spart viel Zeit bei 4K). Fällt automatisch auf Software zurück. `"none"` = aus. |
-| `jobs` | `"auto"` | So viele Segmente werden gleichzeitig gerendert. `"auto"` = 3 bei Hardware-Encoder, 1 bei x265. |
-| `bitrate` | `"3M"` | Nur für die Hardware-Codecs (`*_videotoolbox`, `*_nvenc`, `*_qsv`, `*_amf`) |
-| `audio_rate` | `48000` | Abtastrate des Tons |
-| `audio_codec` | `"aac"` | `"aac"` (klein) oder `"pcm"` (verlustfrei, ca. 10 GB pro 3 h zusätzlich) |
-| `audio_tracks` | `"single"` | `"single"`: 1 Spur mit 4 Kanälen (Resolve-sicher)<br>`"separate"`: 4 einzelne Spuren |
-| `aac_single` | `"384k"` | AAC-Bitrate bei `single` |
-| `aac_mono` / `aac_stereo` | `"96k"` / `"160k"` | AAC-Bitraten pro Spur bei `separate` |
-
-### `sources`
-
-Pro Quelle (`lav_interviewer`, `lav_befragter`, `sony`, `gopro`):
-
-| Schlüssel | Bedeutung |
-|---|---|
-| `offset_s` | Manuelle Korrektur in Sekunden. Positiv heißt später. Für Fälle, in denen der automatische Sync nichts findet. Liegt der Wert auf wenige Sekunden genau, erledigt der Feinsync den Rest. |
-| `tags_are_utc` | Ob der `creation_time`-Tag echte UTC ist (`true`, z.B. Sony) oder nur die Ortszeit mit falschem „Z“ (`false`). Standard ist überall `true`; die eingesetzte GoPro schreibt nachweislich echte UTC. Ist eine Kamera um genau die Zeitzonendifferenz verschoben, diesen Wert umdrehen. Die Grobsuche korrigiert das aber meist automatisch. |
-| `channels` | `"mono"` oder `"stereo"`. Bei `"single"` wird ohnehin jede Quelle mono. |
-| `use_timecode` | Nur Sony: Uhrzeit aus dem Timecode nehmen. Nur sinnvoll, wenn die Kamera auf Time-of-Day-Timecode steht. |
+| `width` / `height` / `fps` | `1920` / `1080` / `25` | Auflösung und Bildrate (ohne `--full_quality_video`) |
+| `vcodec` | `"auto"` | `"auto"`: schnellster funktionierender Hardware-Encoder (Mac `hevc_videotoolbox`, Windows `hevc_nvenc`/`qsv`/`amf`), sonst x265. Fest wählbar: `"x265"`, `"hevc_videotoolbox"`, `"hevc_nvenc"`, `"hevc_qsv"`, `"hevc_amf"`, `"libx264"`, `"h264_videotoolbox"`, `"prores"` |
+| `crf` | `null` | Qualität bei x265/x264 (`null` = 28 bzw. 23; mit `--full_quality_video` 18) |
+| `preset` | `"fast"` | Geschwindigkeit bei x265/x264 |
+| `bitrate` | `"3M"` | Bitrate der Hardware-Encoder (mit `--full_quality_video` automatisch passend zur Auflösung erhöht) |
+| `hwaccel` | `"auto"` | Quellvideos per Hardware decodieren; `"none"` = aus |
+| `jobs` | `"auto"` | Gleichzeitig gerenderte Segmente/Clips (`auto` = 3 bei Hardware-Encoder, 1 bei x265) |
+| `audio_rate` | `48000` | Abtastrate |
+| `aac_per_channel` | `"96k"` | AAC-Bitrate pro Kanal (ohne `--full_quality_audio`) |
+| `audio_tracks` | `"single"` | `"single"`: eine Spur mit allen Kanälen (Resolve-sicher); `"separate"`: einzelne Spuren |
 
 ### `join_tolerance_s`
 
-Standard `3.0`. Lav-Dateien, deren Start höchstens so weit vom Ende der vorherigen entfernt ist, werden lückenlos angehängt. Gilt nur für die Lavs, nicht für Kameras.
+Standard `3.0`. Tondateien, deren Start höchstens so weit vom Ende der vorherigen entfernt ist, werden lückenlos angehängt.
 
-### `cut_gaps`
+### `cut_gaps` (`merge`, `sync-to-audio`)
 
 | Schlüssel | Standard | Bedeutung |
 |---|---|---|
 | `enabled` | `true` | Pausen ohne Bild und Ton herausschneiden |
-| `min_gap_s` | `10` | Ab dieser Pausenlänge wird geschnitten |
-| `keep_s` | `2` | So viele Sekunden Schwarzbild mit Hinweis bleiben stehen |
+| `min_gap_s` | `10` | Ab dieser Länge wird geschnitten |
+| `keep_s` | `2` | So viele Sekunden Schwarzbild bleiben stehen |
 
-### `audio_processing`
-
-Aufbereitung der Tonspuren für automatische Transkription. Sie wird nach dem Sync angewendet; mit `--raw-audio` wird sie für einen Lauf übersprungen.
+### `audio_processing` (aus bei `--full_quality_audio`)
 
 | Schlüssel | Standard | Bedeutung |
 |---|---|---|
 | `enabled` | `true` | Aufbereitung an/aus |
-| `apply_to` | alle vier | Welche Quellen aufbereitet werden |
-| `highpass_hz` | `90` | Entfernt alles unterhalb, z.B. Rumpeln, Wind, Netzbrummen. `0` = aus. |
-| `denoise` | `"afftdn"` | `"afftdn"`: lernt das Grundrauschen laufend und zieht es ab<br>`"rnnoise"`: neuronales Netz, braucht `rnnoise_model`<br>`"none"`: aus |
-| `denoise_db` | `12` | Stärke von afftdn: 6 leicht, 12 mittel, 20 stark. Zu stark erzeugt Artefakte und kann die Transkription verschlechtern. |
-| `rnnoise_model` | `null` | Pfad zu einer `.rnnn`-Modelldatei für `"rnnoise"` |
-| `normalize` | `true` | Dynamische Lautstärkeanpassung (dynaudnorm, RMS-basiert) |
+| `highpass_hz` | `90` | Rumpeln/Wind/Netzbrummen entfernen; `0` = aus |
+| `denoise` | `"afftdn"` | `"afftdn"`, `"rnnoise"` (braucht `rnnoise_model`) oder `"none"` |
+| `denoise_db` | `12` | Stärke: 6 leicht, 12 mittel, 20 stark |
+| `rnnoise_model` | `null` | Pfad zu einer `.rnnn`-Datei (z.B. aus `richardpl/arnndn-models`) |
+| `normalize` | `true` | Dynamische Lautstärkeanpassung |
 | `max_gain_db` | `20` | Maximale Anhebung leiser Stellen |
 | `target_rms` | `0.12` | Ziel-Lautheit (≈ −18 dBFS) |
 
-> Tipp: Bei sehr ruhiger Umgebung reicht `"denoise_db": 6`. Bei Straßenlärm oder Wind kann `"rnnoise"` besser sein; Modelle gibt es z.B. im GitHub-Repo `richardpl/arnndn-models`.
-
-### `pip`
+### `pip`, `text`
 
 | Schlüssel | Standard | Bedeutung |
 |---|---|---|
-| `width_fraction` | `0.3` | Breite des GoPro-Bildes relativ zur Bildbreite |
-| `margin` | `40` | Abstand zum Bildrand in Pixeln (bei 1080p) |
-
-### `text`
-
-| Schlüssel | Standard | Bedeutung |
-|---|---|---|
-| `fontfile` | `null` | Pfad zu einer Schrift (.ttf/.ttc). `null` heißt automatisch, z.B. Arial oder Helvetica. |
-| `size` | `34` | Schriftgröße bei 1080p. Sie skaliert mit der Auflösung. |
+| `pip.width_fraction` | `0.3` | Breite des Bild-im-Bilds relativ zur Bildbreite |
+| `pip.margin` | `40` | Abstand zum Rand (bei 1080p) |
+| `text.fontfile` | `null` | Schriftdatei; `null` = automatisch |
+| `text.size` | `34` | Schriftgröße bei 1080p, skaliert mit der Auflösung |
 
 ### `audio_sync`
 
 | Schlüssel | Standard | Bedeutung |
 |---|---|---|
-| `enabled` | `true` | Audio-Sync an/aus |
-| `lav_to_lav` | `true` | Lav 2 auf Lav 1 synchronisieren |
-| `coarse` | `true` | Grobsuche über die ganze Aufnahme (findet große Uhrzeitfehler) |
-| `coarse_min_ratio` | `1.5` | Mindest-Eindeutigkeit der Grobsuche. Niedriger übernimmt mehr, aber riskanter. |
-| `coarse_min_overlap_s` | `120` | Mindestüberlappung zwischen Kamera und Lavs für einen Treffer |
-| `coarse_local_s` | `300` | Ist die globale Suche nicht eindeutig, wird zusätzlich nur in diesem Fenster (±Sekunden) um die Kamera-Uhrzeit gesucht. Setzt voraus, dass Zeitzone und `tags_are_utc` stimmen. `0` = aus. |
-| `medium` | `true` | Mittlere Suche (Wellenform-Vergleich von Ausschnitten), wenn die Grobsuche nicht eindeutig ist |
-| `medium_window_s` | `300` | Suchbereich der mittleren Suche um die Kamera-Uhrzeit (±Sekunden) |
-| `medium_excerpts` | `6` | Anzahl der verglichenen Ausschnitte |
-| `medium_excerpt_s` | `60` | Länge eines Ausschnitts |
-| `search_s` | `10` | Suchbereich der Feinsuche (±Sekunden) |
-| `analyze_s` | `30` | Länge eines Messfensters |
-| `window_step_s` | `240` | Abstand der Messfenster im Clip |
-| `min_confidence` | `8` | Mindest-Konfidenz eines Feinsync-Messpunkts |
-| `drift_min_span_s` | `600` | Drift wird nur aus Clips berechnet, deren Messpunkte mindestens so weit auseinanderliegen. Kürzere Clips übernehmen die Drift ihrer Kamera. |
+| `enabled` | `true` | Audio-Sync an/aus (aus = nur Uhrzeiten) |
+| `audio_to_audio` | `true` | Weitere Tonquellen auf die erste synchronisieren |
+| `coarse` | `true` | Grobsuche über die ganze Aufnahme |
+| `coarse_min_ratio` | `1.5` | Mindest-Eindeutigkeit der Grobsuche |
+| `coarse_min_overlap_s` | `120` | Mindestüberlappung für einen Treffer |
+| `coarse_local_s` | `300` | Zusätzlich nur ±so viele Sekunden um die Geräte-Uhrzeit suchen, wenn global nicht eindeutig |
+| `medium` | `true` | Mittlere Suche (Wellenform-Ausschnitte) |
+| `medium_window_s` | `300` | Suchbereich der mittleren Suche (±s) |
+| `medium_excerpts` / `medium_excerpt_s` | `6` / `60` | Anzahl und Länge der Ausschnitte |
+| `search_s` | `10` | Suchbereich der Feinsuche (±s) |
+| `analyze_s` / `window_step_s` | `30` / `240` | Länge und Abstand der Feinmessungen |
+| `min_confidence` | `8` | Mindest-Konfidenz einer Messung |
+| `drift_min_span_s` | `600` | Drift wird nur aus Clips berechnet, deren Messpunkte mindestens so weit auseinanderliegen |
+
+---
+
+## Installation von Hand (macOS)
+
+Was `setup.sh` automatisch erledigt:
+
+```bash
+brew install ffmpeg-full                                  # ffmpeg mit Texten (drawtext)
+export PATH="$(brew --prefix ffmpeg-full)/bin:$PATH"      # dauerhaft: in ~/.zshrc eintragen
+python3 -m venv .venv && source .venv/bin/activate
+pip install numpy tzdata
+```
+
+Prüfen: `ffmpeg -hide_banner -filters | grep drawtext` muss eine Zeile liefern. Die Python-Umgebung verlässt du mit `deactivate`.
 
 ---
 
@@ -410,15 +316,15 @@ Aufbereitung der Tonspuren für automatische Transkription. Sie wird nach dem Sy
 
 | Problem | Ursache / Lösung |
 |---|---|
-| `ffmpeg ohne drawtext – Dateinamen werden NICHT eingeblendet` | Es läuft das Standard-ffmpeg. `source setup.sh` ausführen. |
-| `numpy fehlt` | Terminal nicht vorbereitet: `source setup.sh` (macOS), `setup` (Windows cmd) bzw. `. .\setup.ps1` (Windows PowerShell). |
-| Windows cmd: Fehler wie „Sprungmarke nicht gefunden“ | `setup.bat` hat Mac-/Linux-Zeilenenden bekommen. Die beiliegende `.gitattributes` verhindert das bei Git; sonst die Datei in einem Editor mit Windows-Zeilenenden (CRLF) speichern. |
-| Windows: „Ausführung von Skripts ist auf diesem System deaktiviert“ | Einmalig `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, ggf. `Unblock-File .\setup.ps1`. |
-| Windows: `python` öffnet den Microsoft Store | Das ist nur ein Platzhalter. `. .\setup.ps1` installiert echtes Python; danach PowerShell neu öffnen. |
-| Eine Kamera ist um mehrere Stunden verschoben | Falsche `timezone`, oder `tags_are_utc` passt bei dieser Kamera nicht. Mit `--dry-run` prüfen. |
-| Kamera um feste Sekunden/Minuten daneben, Grobsuche sagt „kein eindeutiger Treffer“ | Kamera-Ton zu schlecht (Gehäuse, Wind). Versatz von Hand bestimmen, z.B. über ein Klatschen, und als `offset_s` eintragen. |
-| Timeline viel zu lang | Versehentliche Aufnahmen weit außerhalb des Drehs (z.B. eine kurze DJI-Datei Stunden später) aus den Ordnern nehmen. Pausen dazwischen werden sonst geschnitten, aber die Datei selbst bleibt drin. |
-| Resolve zeigt nur 2 Tonspuren | Siehe Abschnitt „In DaVinci Resolve importieren“. |
-| Anfang des Videos ist stumm | Normal, wenn eine Kamera schon vor den Lavs lief. Der Lav-Ton beginnt erst später. |
-| Ton klingt „blechern“ oder verwaschen | Rauschunterdrückung zu stark: `denoise_db` senken oder `"denoise": "none"`. |
-| Rendern dauert sehr lange | In der Ausgabe prüfen, ob `Video-Encoder: hevc_videotoolbox` (bzw. ein anderer Hardware-Encoder) steht. Steht dort `x265`, ist in der `config.json` vermutlich noch `"vcodec": "x265"` eingetragen. Zusätzlich hilft 720p (`"width": 1280, "height": 720`). |
+| `ffmpeg ohne drawtext – Einblendungen nicht möglich` | Es läuft das Standard-ffmpeg: `source setup.sh` (macOS). Betrifft nur `--info`. |
+| `numpy fehlt` | Terminal nicht vorbereitet: `source setup.sh`, `setup` (cmd) bzw. `. .\setup.ps1`. |
+| Eine Quelle ist um Stunden verschoben | Falsche `timezone` oder `tags_are_utc` passt bei dieser Quelle nicht. Mit `--dry-run` prüfen. |
+| „kein eindeutiger Treffer“ und die Ausschnitte der mittleren Suche zeigen verschiedene Werte | Ton der Quelle zu schlecht. Versatz von Hand bestimmen (z.B. Klatschen) und als `offset_s` unter `sources` eintragen. |
+| Timeline viel zu lang | Versehentliche Aufnahmen weit außerhalb des Drehs aus den Ordnern nehmen. |
+| Resolve zeigt zu wenige Tonspuren | Siehe „In DaVinci Resolve importieren“. |
+| Ton klingt blechern | Rauschunterdrückung zu stark: `denoise_db` senken, `"denoise": "none"` oder `--full_quality_audio`. |
+| Rendern dauert lange | In der Ausgabe muss `Video-Encoder: hevc_videotoolbox` (bzw. ein anderer Hardware-Encoder) stehen. Für `sync-to-video` ist `--full_quality_video` ohne `--info` am schnellsten (keine Neukodierung). |
+| „Hardware-Decoding fehlgeschlagen … wiederhole mit Software-Decoding“ | Harmlos, z.B. bei sehr kurzen Fehlstart-Clips. |
+| Mac lädt beim Rendern kaum | Netzteil hat sich nur auf wenige Watt geeinigt: `system_profiler SPPowerDataType \| grep Wattage`; Stecker an beiden Enden neu einstecken. |
+| Windows cmd: „Sprungmarke nicht gefunden“ | `setup.bat` hat falsche Zeilenenden; die `.gitattributes` verhindert das bei Git. |
+| Windows: „Ausführung von Skripts ist deaktiviert“ | `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, ggf. `Unblock-File .\setup.ps1`. |
