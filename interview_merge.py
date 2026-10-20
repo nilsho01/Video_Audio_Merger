@@ -403,19 +403,13 @@ def chain_and_join(clips, sources, tol):
 
 
 # --------------------------------------------------------------------------- audio
-def build_audio_track(clips, total_s, out, channels, sr, piece_s=120.0):
+def build_audio_track(clips, total_s, out, channels, sr, piece_s=120.0, chunk=24):
     layout = "mono" if channels == 1 else "stereo"
     fmt = f"aformat=sample_fmts=fltp:sample_rates={sr}:channel_layouts={layout}"
     total = int(round(total_s * sr))
     snap = int(0.05 * sr)        # Mini-Lücken zwischen Drift-Abschnitten schließen
-    inputs, chains, labels = [], [], []
+    items = []                   # ("sil", n) oder ("clip", path, tau, skip, n)
     cur, prev = 0, None
-
-    def silence(n):
-        k = len(labels)
-        chains.append(f"anullsrc=r={sr}:cl={layout},{fmt},atrim=end_sample={n}[s{k}]")
-        labels.append(f"[s{k}]")
-
     for c in sorted((c for c in clips if c.has_audio), key=lambda c: c.start):
         for tau, length in c.pieces(piece_s):
             s, n = int(round(c.timeline(tau) * sr)), int(round(length * sr))
@@ -426,19 +420,52 @@ def build_audio_track(clips, total_s, out, channels, sr, piece_s=120.0):
             if n <= 0:
                 continue
             if s > cur:
-                silence(s - cur)
-            idx = len(inputs) // 4
-            inputs += ["-ss", f"{tau:.6f}", "-i", c.path]
-            k = len(labels)
-            chains.append(f"[{idx}:a:0]aresample={sr},{fmt},asetpts=N/SR/TB,atrim=start_sample={skip},"
-                          f"asetpts=N/SR/TB,apad,atrim=end_sample={n}[a{k}]")
-            labels.append(f"[a{k}]")
+                items.append(("sil", s - cur))
+            items.append(("clip", c.path, tau, skip, n))
             cur, prev = s + n, c
-    if total > cur or not labels:
-        silence(max(total - cur, sr))
-    graph = ";".join(chains) + ";" + "".join(labels) + f"concat=n={len(labels)}:v=0:a=1[out]"
-    run(["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", graph, "-map", "[out]",
-         "-c:a", "pcm_s24le", "-rf64", "auto", out])
+    if total > cur or not items:
+        items.append(("sil", max(total - cur, sr)))
+
+    def render(part, dest):
+        # Ein ffmpeg-Aufruf für einen Teil der Stücke (Windows erlaubt nur ~32000 Zeichen pro Befehl)
+        inputs, chains, labels = [], [], []
+        for it in part:
+            k = len(labels)
+            if it[0] == "sil":
+                chains.append(f"anullsrc=r={sr}:cl={layout},{fmt},atrim=end_sample={it[1]}[s{k}]")
+                labels.append(f"[s{k}]")
+            else:
+                _, path, tau, skip, n = it
+                idx = len(inputs) // 4
+                inputs += ["-ss", f"{tau:.6f}", "-i", path]
+                chains.append(f"[{idx}:a:0]aresample={sr},{fmt},asetpts=N/SR/TB,atrim=start_sample={skip},"
+                              f"asetpts=N/SR/TB,apad,atrim=end_sample={n}[a{k}]")
+                labels.append(f"[a{k}]")
+        graph = ";".join(chains) + ";" + "".join(labels) + f"concat=n={len(labels)}:v=0:a=1[out]"
+        run(["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", graph, "-map", "[out]",
+             "-c:a", "pcm_s24le", "-rf64", "auto", dest])
+
+    if len(items) <= chunk:
+        render(items, out)
+        return
+    out = Path(out)
+    parts = []
+    try:
+        for i in range(0, len(items), chunk):
+            dest = out.with_name(f"{out.stem}.teil{len(parts):03d}.wav")
+            render(items[i:i + chunk], dest)
+            parts.append(dest)
+        listfile = out.with_name(f"{out.stem}.teile.txt")
+        listfile.write_text("".join(concat_line(p) for p in parts), encoding="utf-8")
+        run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", listfile,
+             "-c:a", "pcm_s24le", "-rf64", "auto", out])
+        listfile.unlink()
+    finally:
+        for p in parts:
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
 
 def audio_chain(pcfg):
