@@ -644,7 +644,8 @@ def medium_offset(group, ref_wavs, scfg, total, centers):
     good = [r for r in results if r[1] >= thr]
     if len(good) < 2:
         return None
-    best_cluster = max(([g for g in good if abs(g[0] - r[0]) <= 0.15] for r in good), key=len)
+    ctol = float(scfg.get("medium_cluster_s", 2.0))     # Feinsync (±search_s) gleicht den Rest aus
+    best_cluster = max(([g for g in good if abs(g[0] - r[0]) <= ctol] for r in good), key=len)
     if len(best_cluster) < max(2, (len(results) + 1) // 2):
         return None
     return float(np.median([g[0] for g in best_cluster])), len(best_cluster), len(results)
@@ -818,11 +819,15 @@ def rescue_source(clips, ref_wavs, scfg):
     center = j / bins - S
     print(f"       Stapel-Suche: {len(allw)} Fenster, Gipfel bei {center:+.3f}s, "
           f"Score {score:.1f}, Abstand {ratio:.2f}x")
-    if score < float(scfg.get("rescue_min_score", 4.0)) or ratio < float(scfg.get("rescue_min_ratio", 1.15)):
+    if score < float(scfg.get("rescue_min_score", 6.0)) or ratio < float(scfg.get("rescue_min_ratio", 1.3)):
         return None
     near = [max((p for p in pk if abs(p[0] - center) <= 0.15), key=lambda p: p[1], default=None)
             for _, pk in allw]
     near = [p[0] for p in near if p and p[1] >= 5.0]
+    need = max(3, int(0.15 * len(allw)))
+    if len(near) < need:                            # Gipfel muss von echten Einzel-Spitzen getragen sein
+        print(f"       -> verworfen: nur {len(near)} von {len(allw)} Fenstern stützen den Gipfel (nötig {need})")
+        return None
     src_off = float(np.median(near)) if near else center
     res = {}
     for c in clips:
