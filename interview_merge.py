@@ -836,7 +836,8 @@ def rescue_source(clips, ref_wavs, scfg):
             q = [p for p in pk if abs(p[0] - src_off) <= 0.15 and p[1] >= 5.0]
             if q:
                 own.append(max(q, key=lambda p: p[1])[0])
-        res[id(c)] = (float(np.median(own)) if own else src_off, len(own), len(wins[id(c)]))
+        # Einzelne Fenster streuen um ±0,15 s; die Kamera-Uhr ist stabil -> erst ab 3 Fenstern ein eigener Wert
+        res[id(c)] = (float(np.median(own)) if len(own) >= 3 else src_off, len(own), len(wins[id(c)]))
     return src_off, res
 
 
@@ -881,7 +882,7 @@ def fine_sync(clips, ref_wavs, scfg):
                 c.sync_note = c.sync_note.split("Fein")[0]
                 c.start += corr
                 c.drift = d
-                c.sync_note += (f"Fein {corr:+.3f}s (Stapel, {n}/{tot} Fenster)" if n
+                c.sync_note += (f"Fein {corr:+.3f}s (Stapel, {n}/{tot} Fenster)" if n >= 3
                                 else f"Fein: Quellen-Versatz {src_off:+.3f}s (Stapel)")
                 rescued.add(id(c))
     tol = float(scfg.get("source_tolerance_s", 0.4))
