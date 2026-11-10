@@ -296,6 +296,9 @@ Standard `3.0`. Tondateien, deren Start höchstens so weit vom Ende der vorherig
 | `min_confidence` | `8` | Mindest-Konfidenz einer Messung |
 | `drift_min_span_s` | `600` | Drift wird nur aus Clips berechnet, deren Messpunkte mindestens so weit auseinanderliegen |
 | `source_tolerance_s` | `0.4` | Kurze Clips: Messungen, die mehr als so weit vom Konsens ihrer Quelle abweichen, gelten als Fehltreffer und werden durch den Konsens ersetzt |
+| `rescue` | `true` | Stapel-Suche: Clips ohne sichere Einzelmessung (typisch: leiser Kameraton) werden gemeinsam ausgewertet. Alle Messfenster einer Quelle werden übereinandergelegt (GCC-PHAT), weil der Uhr-Versatz einer Kamera fast konstant ist. |
+| `rescue_min_score` / `rescue_min_ratio` | `4` / `1.15` | Mindest-Deutlichkeit und Abstand des Gipfels zum zweitbesten. Darunter bleibt es bei der alten Logik. |
+| `rescue_analyze_s` / `rescue_max_windows` | `45` / `12` | Fensterlänge und maximale Fensterzahl pro Clip der Stapel-Suche |
 
 ---
 

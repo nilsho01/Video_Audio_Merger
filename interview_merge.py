@@ -737,6 +737,104 @@ def fit_line(meas):
     return a, b, int(keep.sum()), float(t[keep].max() - t[keep].min())
 
 
+def phat_scan(ref, clip, sr, S, ref_start, T):
+    """GCC-PHAT: Phasen-Korrelation (Betrag ignoriert, nur Laufzeit) im Sprachband. Deutlich robuster als
+    Wellenform-Vergleich, wenn Kameraton (Raumhall, Entfernung) und Ansteckmikro verschieden klingen.
+    Gibt (Versatz-Array, z-Werte) für Versätze in ±S zurück."""
+    L = len(clip)
+    if len(ref) <= L or np.std(ref) < 1e-7 or np.std(clip) < 1e-7:
+        return None
+    n = 1 << int(np.ceil(np.log2(len(ref) + L)))
+    R = np.fft.rfft(ref, n) * np.conj(np.fft.rfft(clip - clip.mean(), n))
+    R /= np.abs(R) + 1e-9 * np.abs(R).max()
+    f = np.fft.rfftfreq(n, 1.0 / sr)
+    R[(f < 150) | (f > 3500)] = 0
+    cc = np.fft.irfft(R, n)[:len(ref) - L + 1]
+    z = (cc - cc.mean()) / (cc.std() + 1e-12)
+    lag = ref_start + np.arange(len(z)) / sr - T
+    m = np.abs(lag) <= S
+    return (lag[m], z[m]) if m.any() else None
+
+
+def rescue_windows(c, ref_wavs, scfg, sr=8000):
+    """Viele Fenster eines Clips -> [(gebündelte z-Kurve, [(Versatz, z)…Spitzen])]."""
+    S, A = float(scfg["search_s"]), float(scfg.get("rescue_analyze_s", 45.0))
+    bins = float(scfg.get("rescue_bins_per_s", 50.0))
+    nb = int(round(2 * S * bins)) + 1
+    if c.duration <= A + 1:
+        taus = [0.0]
+    else:
+        n = int(min(scfg.get("rescue_max_windows", 12), max(2, c.duration // (A * 1.5))))
+        taus = list(np.linspace(0.0, c.duration - A, n))
+    out = []
+    for tau in taus:
+        a_len = min(A, c.duration - tau)
+        if a_len < 3:
+            continue
+        T = c.timeline(tau)
+        if T + a_len < 1:
+            continue
+        ref_start = max(0.0, T - S)
+        ref = read_ref(ref_wavs, ref_start, (T - ref_start) + a_len + S, sr)
+        clip = read_mono(c.path, tau, a_len, sr)
+        if len(clip) < 2 * sr:
+            continue
+        res = phat_scan(ref, clip, sr, S, ref_start, T)
+        if res is None:
+            continue
+        lag, z = res
+        pooled = np.full(nb, z.min())
+        np.maximum.at(pooled, np.clip(np.round((lag + S) * bins).astype(int), 0, nb - 1), z)
+        pooled = np.minimum(pooled - np.median(pooled), float(scfg.get("rescue_clip_z", 8.0)))
+        peaks = []
+        for i in np.argsort(-z)[:400]:
+            if z[i] < 4.0:
+                break
+            if all(abs(lag[i] - p[0]) > 0.03 for p in peaks):
+                peaks.append((float(lag[i]), float(z[i])))
+            if len(peaks) >= 8:
+                break
+        out.append((pooled, peaks))
+    return out
+
+
+def rescue_source(clips, ref_wavs, scfg):
+    """Fenster ALLER unsicheren Clips einer Quelle übereinanderlegen: Der Versatz ist (fast) konstant, also
+    addiert sich ein schwacher Treffer pro Fenster zu einem eindeutigen Gipfel. -> {id(clip): Versatz} oder None."""
+    S, bins = float(scfg["search_s"]), float(scfg.get("rescue_bins_per_s", 50.0))
+    wins = {id(c): rescue_windows(c, ref_wavs, scfg) for c in clips}
+    allw = [w for ws in wins.values() for w in ws]
+    if len(allw) < int(scfg.get("rescue_min_windows", 3)):
+        return None
+    stack = np.sum([w[0] for w in allw], axis=0)
+    med = np.median(stack)
+    sd = 1.4826 * np.median(np.abs(stack - med)) + 1e-9
+    j = int(np.argmax(stack))
+    score = (stack[j] - med) / sd
+    masked = stack.copy()
+    g = int(0.3 * bins)
+    masked[max(0, j - g):j + g + 1] = -np.inf
+    ratio = (stack[j] - med) / max(masked.max() - med, 1e-9)
+    center = j / bins - S
+    print(f"       Stapel-Suche: {len(allw)} Fenster, Gipfel bei {center:+.3f}s, "
+          f"Score {score:.1f}, Abstand {ratio:.2f}x")
+    if score < float(scfg.get("rescue_min_score", 4.0)) or ratio < float(scfg.get("rescue_min_ratio", 1.15)):
+        return None
+    near = [max((p for p in pk if abs(p[0] - center) <= 0.15), key=lambda p: p[1], default=None)
+            for _, pk in allw]
+    near = [p[0] for p in near if p and p[1] >= 5.0]
+    src_off = float(np.median(near)) if near else center
+    res = {}
+    for c in clips:
+        own = []
+        for _, pk in wins[id(c)]:
+            q = [p for p in pk if abs(p[0] - src_off) <= 0.15 and p[1] >= 5.0]
+            if q:
+                own.append(max(q, key=lambda p: p[1])[0])
+        res[id(c)] = (float(np.median(own)) if own else src_off, len(own), len(wins[id(c)]))
+    return src_off, res
+
+
 def fine_sync(clips, ref_wavs, scfg):
     min_span = float(scfg["drift_min_span_s"])
     results = {}
@@ -757,6 +855,30 @@ def fine_sync(clips, ref_wavs, scfg):
             drifts.setdefault(c.source, []).append(c.drift)
             fit_cache[id(c)] = a
             results[id(c)] = "done"
+    rescued = set()
+    if scfg.get("rescue", True):                    # Stapel-Suche für Quellen mit unsicheren Clips
+        for src in dict.fromkeys(c.source for c in clips):
+            todo = [c for c in clips if c.source == src and c.has_audio and results.get(id(c)) != "done"]
+            if not todo:
+                continue
+            print(f"     {src}: {len(todo)} Clips ohne sichere Einzelmessung – Stapel-Suche ...")
+            try:
+                got = rescue_source(todo, ref_wavs, scfg)
+            except Exception as e:                  # Rettung darf den Lauf nie abbrechen
+                print(f"       Stapel-Suche fehlgeschlagen: {e}")
+                got = None
+            if not got:
+                continue
+            src_off, res = got
+            d = float(np.median(drifts[src])) if drifts.get(src) else 0.0
+            for c in todo:
+                corr, n, tot = res[id(c)]
+                c.sync_note = c.sync_note.split("Fein")[0]
+                c.start += corr
+                c.drift = d
+                c.sync_note += (f"Fein {corr:+.3f}s (Stapel, {n}/{tot} Fenster)" if n
+                                else f"Fein: Quellen-Versatz {src_off:+.3f}s (Stapel)")
+                rescued.add(id(c))
     tol = float(scfg.get("source_tolerance_s", 0.4))
     votes = {}                                      # Quelle -> Versatz-Stimmen (lange Fits + kurze Messungen)
     for c in clips:
@@ -765,7 +887,7 @@ def fine_sync(clips, ref_wavs, scfg):
     short = {}
     for c in clips:                                 # kurze Clips: Drift der Quelle übernehmen
         meas = results.get(id(c))
-        if meas == "done" or meas is None:
+        if meas == "done" or meas is None or id(c) in rescued:
             continue
         d = float(np.median(drifts[c.source])) if drifts.get(c.source) else 0.0
         vals = [m[1] - (d - c.drift) * m[0] for m in meas] if meas else []
