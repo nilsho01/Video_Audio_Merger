@@ -20,6 +20,7 @@ Optionen:
   --only_new_audio       Kameraton weglassen (wird intern trotzdem zum Synchronisieren genutzt)
   --full_quality_video   Originalauflösung/-bildrate; sync-to-video ohne --info kopiert das Bild unverändert
   --full_quality_audio   Ton unbearbeitet als PCM (keine Rauschunterdrückung/Lautstärkeanpassung)
+  --video_bitrate 100M   feste Bitrate beim Neuberechnen des Bildes (z.B. für sync-to-audio in hoher Qualität)
   -o / -n / --fresh / --dry-run / --config
 
 Voraussetzungen: ffmpeg/ffprobe (mit drawtext für --info), Python 3.9+, numpy (für Sync).
@@ -744,7 +745,7 @@ def fine_sync(clips, ref_wavs, scfg):
             c.sync_note += "kein Ton"
             continue
         results[id(c)] = measure(c, ref_wavs, scfg)
-    drifts = {}
+    drifts, fit_cache = {}, {}
     for c in clips:                                 # lange Clips: Versatz + Drift
         meas = results.get(id(c)) or []
         fit = fit_line(meas) if len(meas) >= 2 else None
@@ -754,33 +755,53 @@ def fine_sync(clips, ref_wavs, scfg):
             c.drift = (1 + c.drift) * (1 + b) - 1
             c.sync_note += f"Fein {a:+.3f}s, Drift {c.drift * 1e6:+.0f} ppm ({n} Messpunkte)"
             drifts.setdefault(c.source, []).append(c.drift)
+            fit_cache[id(c)] = a
             results[id(c)] = "done"
-    offsets = {}
+    tol = float(scfg.get("source_tolerance_s", 0.4))
+    votes = {}                                      # Quelle -> Versatz-Stimmen (lange Fits + kurze Messungen)
+    for c in clips:
+        if results.get(id(c)) == "done":
+            votes.setdefault(c.source, []).append(float(fit_cache[id(c)]))
+    short = {}
     for c in clips:                                 # kurze Clips: Drift der Quelle übernehmen
         meas = results.get(id(c))
         if meas == "done" or meas is None:
             continue
         d = float(np.median(drifts[c.source])) if drifts.get(c.source) else 0.0
         vals = [m[1] - (d - c.drift) * m[0] for m in meas] if meas else []
+        c.drift = d
         if len(vals) >= 2 and max(vals) - min(vals) > 0.2:
-            c.drift = d
             c.sync_note += (f"Fein: Messungen widersprüchlich ({min(vals):+.2f}…{max(vals):+.2f}s) – "
                             f"keine sichere Messung")
-            continue
-        if meas:
-            corr = float(np.median(vals))
-            c.start += corr
-            c.drift = d
-            c.sync_note += f"Fein {corr:+.3f}s ({len(meas)} Messpunkt(e))"
-            offsets.setdefault(c.source, []).append(corr)
+        elif vals:
+            short[id(c)] = float(np.median(vals))
+            votes.setdefault(c.source, []).append(short[id(c)])
         else:
-            c.drift = d
             c.sync_note += "Fein: keine sichere Messung"
-    for c in clips:                                 # ganz ohne Messung: Median der Quelle
-        if "keine sichere Messung" in c.sync_note and offsets.get(c.source):
-            med = float(np.median(offsets[c.source]))
-            c.start += med
-            c.sync_note += f" -> Median der Quelle {med:+.3f}s"
+
+    def consensus(vs):                              # dichtester Häufungspunkt (Kamera-Uhr ist stabil)
+        if not vs:
+            return None
+        best = max(([v for v in vs if abs(v - u) <= tol] for u in vs), key=len)
+        return float(np.median(best)), len(best)
+
+    cons = {src: consensus(vs) for src, vs in votes.items()}
+    for c in clips:
+        if id(c) in short:
+            corr, cs = short[id(c)], cons.get(c.source)
+            n = len(votes[c.source])
+            if n >= 3 and (cs is None or cs[1] < 2):
+                c.sync_note += f"Fein {corr:+.3f}s verworfen (Quelle ohne einheitlichen Versatz) – keine sichere Messung"
+            elif cs and n >= 3 and abs(corr - cs[0]) > tol:
+                c.sync_note += f"Fein {corr:+.3f}s verworfen (Ausreißer, Quelle {cs[0]:+.3f}s) – keine sichere Messung"
+            else:
+                c.start += corr
+                c.sync_note += f"Fein {corr:+.3f}s"
+    for c in clips:                                 # ohne brauchbare Messung: Konsens der Quelle
+        cs = cons.get(c.source)
+        if "keine sichere Messung" in c.sync_note and cs and cs[1] >= 2:
+            c.start += cs[0]
+            c.sync_note += f" -> Konsens der Quelle {cs[0]:+.3f}s ({cs[1]} Clips)"
 
 
 # --------------------------------------------------------------------------- video
@@ -810,6 +831,11 @@ def resolve_encoder(o):
 
 def vcodec_args(o):
     v = o["vcodec"]
+    if v == "x265" and o.get("force_bitrate"):
+        return ["-c:v", "libx265", "-b:v", o["bitrate"], "-preset", o["preset"],
+                "-pix_fmt", "yuv420p", "-tag:v", "hvc1", "-x265-params", "log-level=error"]
+    if v == "libx264" and o.get("force_bitrate"):
+        return ["-c:v", "libx264", "-b:v", o["bitrate"], "-preset", o["preset"], "-pix_fmt", "yuv420p"]
     if v == "x265":
         return ["-c:v", "libx265", "-crf", str(o.get("crf") or 28), "-preset", o["preset"],
                 "-pix_fmt", "yuv420p", "-tag:v", "hvc1", "-x265-params", "log-level=error"]
@@ -835,8 +861,9 @@ def full_quality_settings(o, clip):
     o["width"], o["height"] = clip.width or o["width"], clip.height or o["height"]
     o["fps_str"] = clip.fps_str or str(o["fps"])
     o["fps"] = fps_value(o["fps_str"])
-    mbit = max(8, round(o["width"] * o["height"] * o["fps"] * 0.1 / 1e6))
-    o["bitrate"] = f"{mbit}M"
+    if not o.get("force_bitrate"):
+        mbit = max(8, round(o["width"] * o["height"] * o["fps"] * 0.1 / 1e6))
+        o["bitrate"] = f"{mbit}M"
     o["crf"] = o.get("crf") or 18
 
 
@@ -1109,9 +1136,21 @@ def channel_labels(names, chans):
     return " | ".join(out)
 
 
+DISCRETE_LAYOUTS = {3: "3.0", 4: "4.0", 5: "5.0", 6: "6.0", 7: "7.0", 8: "octagonal"}
+
+
+def relabel(n_channels):
+    """Mehrkanal-Ton ohne LFE-Kanal beschriften (amerge würde z.B. 3 Kanäle als 2.1 mit Subwoofer markieren)."""
+    lay = DISCRETE_LAYOUTS.get(n_channels)
+    return f",channelmap=channel_layout={lay}" if lay else ""
+
+
 def audio_out_args(n_channels, full_audio, o):
     if full_audio:
         return ["-c:a", "pcm_s24le"]
+    if n_channels > 2:
+        # Mehrkanal-AAC spielt DaVinci Resolve oft stumm ab -> PCM 16 bit (≈0,77 Mbit/s pro Kanal)
+        return ["-c:a", "pcm_s16le"]
     rate = int(str(o["aac_per_channel"]).rstrip("k"))
     return ["-c:a", "aac", "-b:a", f"{min(rate * n_channels, 1024)}k"]
 
@@ -1128,9 +1167,11 @@ def mux_audio_graph(inputs, names, first_idx, o, full_audio, chans=None):
         if n == 1:
             graph = graph.replace("[m0]", "[a]")
         else:
-            graph += ";" + "".join(f"[m{i}]" for i in range(n)) + f"amerge=inputs={n}[a]"
-        title = channel_labels(names, [c if full_audio else 1 for c in chans])
-        return ["-filter_complex", graph, "-map", "[a]", *audio_out_args(n, full_audio, o)], \
+            total = sum(2 if full_audio and c >= 2 else 1 for c in chans)
+            graph += ";" + "".join(f"[m{i}]" for i in range(n)) + f"amerge=inputs={n}{relabel(total)}[a]"
+        total = sum(2 if full_audio and c >= 2 else 1 for c in chans)
+        title = channel_labels(names, [min(c, 2) if full_audio else 1 for c in chans])
+        return ["-filter_complex", graph, "-map", "[a]", *audio_out_args(total, full_audio, o)], \
             ["-metadata:s:a:0", f"title={title}"]
     maps, meta = [], []
     for i, nm in enumerate(names):
@@ -1166,6 +1207,8 @@ def parse_args():
                     help="Originalauflösung/-bildrate; sync-to-video ohne --info kopiert das Bild unverändert")
     ap.add_argument("--full_quality_audio", "--full-quality-audio", action="store_true",
                     help="Ton unbearbeitet als PCM, ohne Rauschunterdrückung/Lautstärkeanpassung")
+    ap.add_argument("--video_bitrate", "--video-bitrate", metavar="RATE",
+                    help="feste Video-Bitrate beim Neuberechnen, z.B. 100M (gilt nicht fürs unveränderte Kopieren)")
     ap.add_argument("-o", "--output", type=Path, help="Ausgabeordner (Standard: Ordner über dem Kameraordner)")
     ap.add_argument("-n", "--name", help="Name der Ausgabe (sync-to-video: Präfix der Dateinamen)")
     ap.add_argument("--fresh", action="store_true", help="Zwischenstand ignorieren, komplett neu")
@@ -1210,6 +1253,12 @@ def main():
 
     mode = args.mode
     o = cfg["output"]
+    if args.video_bitrate:
+        vb = args.video_bitrate.strip()
+        if not re.fullmatch(r"\d+(\.\d+)?[kKmM]?", vb):
+            sys.exit(f"--video_bitrate {vb!r}: bitte z.B. 100M oder 80000k angeben")
+        o["bitrate"], o["force_bitrate"] = vb.upper().replace("K", "k"), True
+        print(f"Video-Bitrate: {o['bitrate']}")
     full_v, full_a = args.full_quality_video, args.full_quality_audio
     sources = parse_sources(args, cfg)
     audio_srcs = [s for s in sources if s.kind == "audio"]
@@ -1660,15 +1709,16 @@ def run_sync_to_video(args, cfg, clips, video_src, audio_srcs, final, chain, tmp
             labels.append("[cam]")
             names.append(f"{video_src.name} (Kamera)")
         nch = len(labels)
+        total_ch = nch + (1 if "stereo" in cam_lay and len(names) > len(audio_srcs) else 0)
         if o["audio_tracks"] == "single":
             if nch > 1:
-                graphs.append("".join(labels) + f"amerge=inputs={nch}[aout]")
+                graphs.append("".join(labels) + f"amerge=inputs={nch}{relabel(total_ch)}[aout]")
             else:
                 graphs[-1] = graphs[-1].rsplit("[", 1)[0] + "[aout]"
             amaps = ["-map", "[aout]"]
             chs = [1] * len(audio_srcs) + ([2 if "stereo" in cam_lay else 1] if len(names) > len(audio_srcs) else [])
             meta = ["-metadata:s:a:0", "title=" + channel_labels(names, chs)]
-            acodec = audio_out_args(nch, full_a, o)
+            acodec = audio_out_args(total_ch, full_a, o)
         else:
             amaps = [x for lb in labels for x in ("-map", lb)]
             meta = [x for i, nm in enumerate(names) for x in (f"-metadata:s:a:{i}", f"title={nm}")]

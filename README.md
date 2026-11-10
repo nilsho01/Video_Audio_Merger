@@ -75,6 +75,7 @@ python3 interview_merge.py MODUS --audio [NAME=]PFAD [--audio ...] --video [NAME
 | `--only_new_audio` | Kameraton weglassen. Er wird intern trotzdem zum Synchronisieren benutzt. |
 | `--full_quality_video` | Originalauflösung und -bildrate der Kamera, hohe Bitrate. Bei `sync-to-video` **ohne** `--info` wird das Bild sogar **bitgenau unverändert** kopiert (keine Neukodierung, sehr schnell). |
 | `--full_quality_audio` | Ton **unbearbeitet** als PCM (24 bit), ohne Rauschunterdrückung und Lautstärkeanpassung; Kameraton bleibt Stereo. |
+| `--video_bitrate 100M` | Feste Video-Bitrate, wenn das Bild neu berechnet wird (merge, sync-to-audio, sync-to-video mit `--info`). Ohne die Option gilt bei `--full_quality_video` etwa 0,1 bit pro Pixel (4K/25p ≈ 21 Mbit/s). 80–100M ist bei 4K praktisch nicht vom Original zu unterscheiden. Wichtig: `--full_quality_video` ist **nicht verlustfrei** – verlustfrei sind nur die unverändert kopierten Clips von sync-to-video ohne `--info`. |
 | `-o PFAD` | Ausgabeordner (wird angelegt). Standard: der Ordner über dem Kameraordner. |
 | `-n NAME` | Name des Videos (`merge`, `sync-to-audio`). Bei `sync-to-video` Präfix vor jedem Dateinamen. |
 | `--dry-run` | Nur Dateien und Zeiten erkennen und anzeigen, nichts rendern. Dauert Sekunden. |
@@ -294,6 +295,7 @@ Standard `3.0`. Tondateien, deren Start höchstens so weit vom Ende der vorherig
 | `analyze_s` / `window_step_s` | `30` / `240` | Länge und Abstand der Feinmessungen |
 | `min_confidence` | `8` | Mindest-Konfidenz einer Messung |
 | `drift_min_span_s` | `600` | Drift wird nur aus Clips berechnet, deren Messpunkte mindestens so weit auseinanderliegen |
+| `source_tolerance_s` | `0.4` | Kurze Clips: Messungen, die mehr als so weit vom Konsens ihrer Quelle abweichen, gelten als Fehltreffer und werden durch den Konsens ersetzt |
 
 ---
 
