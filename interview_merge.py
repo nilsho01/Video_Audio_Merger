@@ -759,7 +759,7 @@ def phat_scan(ref, clip, sr, S, ref_start, T):
 
 def rescue_windows(c, ref_wavs, scfg, sr=8000):
     """Viele Fenster eines Clips -> [(gebündelte z-Kurve, [(Versatz, z)…Spitzen])]."""
-    S, A = float(scfg["search_s"]), float(scfg.get("rescue_analyze_s", 45.0))
+    S, A = float(scfg.get("rescue_search_s", 20.0)), float(scfg.get("rescue_analyze_s", 45.0))
     bins = float(scfg.get("rescue_bins_per_s", 50.0))
     nb = int(round(2 * S * bins)) + 1
     if c.duration <= A + 1:
@@ -801,8 +801,11 @@ def rescue_windows(c, ref_wavs, scfg, sr=8000):
 
 def rescue_source(clips, ref_wavs, scfg):
     """Fenster ALLER unsicheren Clips einer Quelle übereinanderlegen: Der Versatz ist (fast) konstant, also
-    addiert sich ein schwacher Treffer pro Fenster zu einem eindeutigen Gipfel. -> {id(clip): Versatz} oder None."""
-    S, bins = float(scfg["search_s"]), float(scfg.get("rescue_bins_per_s", 50.0))
+    addiert sich ein schwacher Treffer pro Fenster zu einem eindeutigen Gipfel. Danach bekommt jeder Clip
+    seinen eigenen Wert, wenn er einen sicheren Sprung gegenüber der Quelle zeigt (z. B. Kamera-Uhr wurde
+    zwischendurch gestellt); ohne eigene Messung gilt der Wert der zeitlichen Nachbarn.
+    -> (Quellen-Versatz, {id(clip): (Versatz, Notiz)}) oder None."""
+    S, bins = float(scfg.get("rescue_search_s", 20.0)), float(scfg.get("rescue_bins_per_s", 50.0))
     wins = {id(c): rescue_windows(c, ref_wavs, scfg) for c in clips}
     allw = [w for ws in wins.values() for w in ws]
     if len(allw) < int(scfg.get("rescue_min_windows", 3)):
@@ -817,9 +820,9 @@ def rescue_source(clips, ref_wavs, scfg):
     masked[max(0, j - g):j + g + 1] = -np.inf
     ratio = (stack[j] - med) / max(masked.max() - med, 1e-9)
     center = j / bins - S
-    print(f"       Stapel-Suche: {len(allw)} Fenster, Gipfel bei {center:+.3f}s, "
+    print(f"       Stapel-Suche (±{S:.0f}s): {len(allw)} Fenster, Gipfel bei {center:+.3f}s, "
           f"Score {score:.1f}, Abstand {ratio:.2f}x")
-    if score < float(scfg.get("rescue_min_score", 6.0)) or ratio < float(scfg.get("rescue_min_ratio", 1.3)):
+    if score < float(scfg.get("rescue_min_score", 6.0)):
         return None
     near = [max((p for p in pk if abs(p[0] - center) <= 0.15), key=lambda p: p[1], default=None)
             for _, pk in allw]
@@ -828,16 +831,57 @@ def rescue_source(clips, ref_wavs, scfg):
     if len(near) < need:                            # Gipfel muss von echten Einzel-Spitzen getragen sein
         print(f"       -> verworfen: nur {len(near)} von {len(allw)} Fenstern stützen den Gipfel (nötig {need})")
         return None
-    src_off = float(np.median(near)) if near else center
-    res = {}
+    src_off = float(np.median(near))
+
+    def own_offset(pks_per_window):
+        """Bester Versatz eines Clips aus seinen Fenster-Spitzen: (Versatz, Fensterzahl, Summe z) oder None."""
+        cands = [p for pk in pks_per_window for p in pk if p[1] >= 5.0]
+        best = None
+        for lag, _ in cands:
+            hits = [max((p for p in pk if abs(p[0] - lag) <= 0.15), key=lambda p: p[1], default=None)
+                    for pk in pks_per_window]
+            hits = [h for h in hits if h and h[1] >= 5.0]
+            tot = sum(h[1] for h in hits)
+            if best is None or tot > best[2]:
+                best = (float(np.median([h[0] for h in hits])), len(hits), tot, max(h[1] for h in hits))
+        if best is None:
+            return None
+        if (best[1] >= 2 and best[2] >= 10.0) or best[3] >= float(scfg.get("rescue_single_z", 7.0)):
+            return best[:3]
+        return None
+
+    snap = float(scfg.get("rescue_snap_s", 0.5))
+    found = {}
     for c in clips:
-        own = []
-        for _, pk in wins[id(c)]:
-            q = [p for p in pk if abs(p[0] - src_off) <= 0.15 and p[1] >= 5.0]
-            if q:
-                own.append(max(q, key=lambda p: p[1])[0])
-        # Einzelne Fenster streuen um ±0,15 s; die Kamera-Uhr ist stabil -> erst ab 3 Fenstern ein eigener Wert
-        res[id(c)] = (float(np.median(own)) if len(own) >= 3 else src_off, len(own), len(wins[id(c)]))
+        o = own_offset([pk for _, pk in wins[id(c)]])
+        if o is None:
+            continue
+        off, n, _ = o
+        if n < 3 and abs(off - src_off) <= snap:
+            found[id(c)] = (src_off, "Stapel")      # Einzelfenster streuen ±0,15 s: auf Quelle einrasten
+        elif n >= 3 and abs(off - src_off) <= snap:
+            found[id(c)] = (off, f"Stapel, {n}/{len(wins[id(c)])} Fenster")
+        else:
+            found[id(c)] = (off, f"eigener Sprung {off - src_off:+.2f}s ggü. Quelle")
+    order = sorted(clips, key=lambda c: c.start)
+    res = {}
+    for i, c in enumerate(order):
+        if id(c) in found:
+            res[id(c)] = found[id(c)]
+            continue
+        prev = next((found[id(order[k])][0] for k in range(i - 1, -1, -1) if id(order[k]) in found), None)
+        nxt = next((found[id(order[k])][0] for k in range(i + 1, len(order)) if id(order[k]) in found), None)
+        if prev is not None and nxt is not None and abs(prev - nxt) > snap:
+            res[id(c)] = (src_off, "Quellen-Versatz, Nachbarn uneinig")
+        elif prev is not None or nxt is not None:
+            res[id(c)] = (prev if prev is not None else nxt, "wie Nachbar-Clip")
+        else:
+            res[id(c)] = (src_off, "Quellen-Versatz")
+    groups = {}
+    for off, _ in res.values():
+        groups.setdefault(round(off / 0.5) * 0.5, []).append(off)
+    print("       Versatz-Gruppen: " + ", ".join(f"{np.median(v):+.2f}s ({len(v)} Clips)"
+                                               for _, v in sorted(groups.items(), key=lambda kv: -len(kv[1]))))
     return src_off, res
 
 
@@ -878,12 +922,11 @@ def fine_sync(clips, ref_wavs, scfg):
             src_off, res = got
             d = float(np.median(drifts[src])) if drifts.get(src) else 0.0
             for c in todo:
-                corr, n, tot = res[id(c)]
+                corr, how = res[id(c)]
                 c.sync_note = c.sync_note.split("Fein")[0]
                 c.start += corr
                 c.drift = d
-                c.sync_note += (f"Fein {corr:+.3f}s (Stapel, {n}/{tot} Fenster)" if n >= 3
-                                else f"Fein: Quellen-Versatz {src_off:+.3f}s (Stapel)")
+                c.sync_note += f"Fein {corr:+.3f}s ({how})"
                 rescued.add(id(c))
     tol = float(scfg.get("source_tolerance_s", 0.4))
     votes = {}                                      # Quelle -> Versatz-Stimmen (lange Fits + kurze Messungen)
