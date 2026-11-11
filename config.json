@@ -31,6 +31,7 @@
     "audio_tracks": "single"
   },
   "join_tolerance_s": 3.0,
+  "split_join_max_s": 30.0,
   "cut_gaps": {
     "enabled": true,
     "min_gap_s": 10.0,

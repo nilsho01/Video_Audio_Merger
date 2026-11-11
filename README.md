@@ -248,6 +248,10 @@ Liegt neben dem Skript. Es müssen nur abweichende Werte drinstehen.
 
 Standard `3.0`. Tondateien, deren Start höchstens so weit vom Ende der vorherigen entfernt ist, werden lückenlos angehängt.
 
+### `split_join_max_s`
+
+Standard `30`. Dateien mit voller Länge (z.B. 30:45 bei DJI Mic) sind Auto-Teilungen des Recorders, die nächste Datei beginnt sofort. Liegt zwischen ihnen trotzdem eine Lücke bis zu diesem Wert (z.B. 10 s, weil der Dateiname der ersten Datei nicht stimmt), wird die frühere Datei an die folgende herangezogen. `0` schaltet das ab.
+
 ### `cut_gaps` (`merge`, `sync-to-audio`)
 
 | Schlüssel | Standard | Bedeutung |

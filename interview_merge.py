@@ -78,6 +78,8 @@ DEFAULT_CONFIG = {
     },
     # Audio-Dateien, deren Start so nah am Ende der vorherigen liegt, werden lückenlos angehängt
     "join_tolerance_s": 3.0,
+    # Lücke zwischen zwei Auto-Teilungen (voll lange Dateien), die noch als lückenlos gilt; 0 = aus
+    "split_join_max_s": 30.0,
     # merge/sync-to-audio: Pausen ohne Bild und Ton herausschneiden
     "cut_gaps": {"enabled": True, "min_gap_s": 10.0, "keep_s": 2.0},
     # Tonaufbereitung für Transkription (aus bei --full_quality_audio)
@@ -380,7 +382,8 @@ def load_clips(sources):
     return clips
 
 
-def chain_and_join(clips, sources, tol):
+def chain_and_join(clips, sources, tol, split_max=30.0):
+    CFG_SPLIT_JOIN_MAX_S = split_max
     for s in sources:
         lst = clips[s.key]
         if s.is_video:   # GoPro-Kapitel (GX01xxxx, GX02xxxx ...) direkt aneinander
@@ -395,6 +398,20 @@ def chain_and_join(clips, sources, tol):
                     c.start_dt, c.method = p.end_dt, f"GoPro-Kapitel nach {p.path.name}"
             lst.sort(key=lambda c: c.start_dt)
             continue
+        # Voll lange Dateien sind Auto-Teilungen des Recorders (z.B. DJI Mic alle 30:45): die nächste Datei
+        # beginnt sofort. Ist die Lücke trotzdem größer als tol (z.B. 10 s, weil der Dateiname der ersten Datei
+        # um diese Zeit nicht stimmt), wandert die frühere Datei an das Ende-an-Anfang-Maß; die späteren
+        # Dateien bleiben stehen.
+        max_gap = float(CFG_SPLIT_JOIN_MAX_S)
+        durs = [c.duration for c in lst]
+        full = max(durs, default=0.0)
+        if max_gap > 0 and sum(abs(d - full) <= 1.0 for d in durs) >= 2:
+            for i in range(len(lst) - 2, -1, -1):
+                prev, cur = lst[i], lst[i + 1]
+                gap = (cur.start_dt - prev.end_dt).total_seconds()
+                if abs(prev.duration - full) <= 1.0 and tol < abs(gap) <= max_gap:
+                    prev.start_dt = cur.start_dt - timedelta(seconds=prev.duration)
+                    prev.method += f" | vorgezogen an Folgedatei (Lücke war {gap:+.2f}s)"
         # automatisch geteilte Tonaufnahmen (z.B. DJI Mic 2 alle 30 min) lückenlos anhängen
         for prev, cur in zip(lst, lst[1:]):
             gap = (cur.start_dt - prev.end_dt).total_seconds()
@@ -1277,7 +1294,7 @@ def analyse_key(every, sources, cfg, mode):
         st = c.path.stat()
         files.append([c.source, str(c.path), st.st_size, int(st.st_mtime)])
     srcs = [[s.key, s.kind, str(s.path), s.cfg] for s in sources]
-    rel = {k: cfg.get(k) for k in ("timezone", "join_tolerance_s", "audio_sync")}
+    rel = {k: cfg.get(k) for k in ("timezone", "join_tolerance_s", "split_join_max_s", "audio_sync")}
     cut = cfg["cut_gaps"] if mode != "sync-to-video" else None
     data = [ANALYSE_VERSION, mode, files, srcs, rel, cut, cfg["output"]["audio_rate"]]
     return hashlib.sha1(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest()
@@ -1446,7 +1463,7 @@ def main():
     print(f"Modus: {mode}")
     print("Lese Dateien ...")
     clips = load_clips(sources)
-    chain_and_join(clips, sources, cfg["join_tolerance_s"])
+    chain_and_join(clips, sources, cfg["join_tolerance_s"], cfg.get("split_join_max_s", 30.0))
     audio_srcs = [s for s in audio_srcs if clips[s.key]]
     if not audio_srcs:
         sys.exit("Keine Tondateien gefunden.")
