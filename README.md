@@ -300,6 +300,7 @@ Standard `3.0`. Tondateien, deren Start höchstens so weit vom Ende der vorherig
 | `rescue` | `true` | Stapel-Suche: Clips ohne sichere Einzelmessung (typisch: leiser Kameraton) werden gemeinsam ausgewertet. Alle Messfenster einer Quelle werden übereinandergelegt (GCC-PHAT), weil der Uhr-Versatz einer Kamera fast konstant ist. |
 | `rescue_min_score` / `rescue_min_ratio` | `6` / `1.3` | Mindest-Deutlichkeit und Abstand des Gipfels zum zweitbesten. Darunter bleibt es bei der alten Logik. |
 | `rescue_search_s` | `20` | Suchbereich der Stapel-Suche (±s). Größer als `search_s`, damit auch Clips gefunden werden, deren Kamera-Uhr zwischendurch um einige Sekunden gesprungen ist |
+| `rescue_band_s` | `0.8` | Stapel-Suche: Einzelmessungen bis so weit vom Quellen-Versatz gelten als echt (Sony-Uhrzeiten sind auf ganze Sekunden gerundet, der Versatz streut deshalb von Clip zu Clip um bis zu ~1 s). Weiter entfernte Werte zählen nur mit mindestens 3 Fenstern. |
 | `rescue_analyze_s` / `rescue_max_windows` | `45` / `12` | Fensterlänge und maximale Fensterzahl pro Clip der Stapel-Suche |
 
 ---

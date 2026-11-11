@@ -850,19 +850,26 @@ def rescue_source(clips, ref_wavs, scfg):
             return best[:3]
         return None
 
-    snap = float(scfg.get("rescue_snap_s", 0.5))
-    found = {}
+    # Sony-Uhrzeiten sind auf ganze Sekunden gerundet -> der echte Versatz streut von Clip zu Clip um bis zu ~1 s.
+    # Deshalb zählt jede sichere Einzelmessung innerhalb des Bandes; größere Sprünge nur mit >= 3 Fenstern.
+    band = float(scfg.get("rescue_band_s", 0.8))
+    found, rejected = {}, []
     for c in clips:
         o = own_offset([pk for _, pk in wins[id(c)]])
         if o is None:
             continue
         off, n, _ = o
-        if n < 3 and abs(off - src_off) <= snap:
-            found[id(c)] = (src_off, "Stapel")      # Einzelfenster streuen ±0,15 s: auf Quelle einrasten
-        elif n >= 3 and abs(off - src_off) <= snap:
+        if abs(off - src_off) <= band:
             found[id(c)] = (off, f"Stapel, {n}/{len(wins[id(c)])} Fenster")
+        elif n >= 3:
+            found[id(c)] = (off, f"eigener Sprung {off - src_off:+.2f}s ggü. Quelle, {n} Fenster")
         else:
-            found[id(c)] = (off, f"eigener Sprung {off - src_off:+.2f}s ggü. Quelle")
+            rejected.append((c.path.name, off))
+    if rejected:
+        print("       Verworfen (Einzelfenster weit außerhalb): "
+              + ", ".join(f"{n} {o:+.1f}s" for n, o in rejected))
+    inb = [v[0] for v in found.values() if abs(v[0] - src_off) <= band]
+    typ = float(np.median(inb)) if inb else src_off
     order = sorted(clips, key=lambda c: c.start)
     res = {}
     for i, c in enumerate(order):
@@ -871,12 +878,11 @@ def rescue_source(clips, ref_wavs, scfg):
             continue
         prev = next((found[id(order[k])][0] for k in range(i - 1, -1, -1) if id(order[k]) in found), None)
         nxt = next((found[id(order[k])][0] for k in range(i + 1, len(order)) if id(order[k]) in found), None)
-        if prev is not None and nxt is not None and abs(prev - nxt) > snap:
-            res[id(c)] = (src_off, "Quellen-Versatz, Nachbarn uneinig")
-        elif prev is not None or nxt is not None:
-            res[id(c)] = (prev if prev is not None else nxt, "wie Nachbar-Clip")
+        if (prev is not None and nxt is not None and abs(prev - nxt) <= band
+                and abs(prev - src_off) > band):        # Sprung hält an (Uhr wurde gestellt)
+            res[id(c)] = ((prev + nxt) / 2, "wie Nachbar-Clips (Sprung)")
         else:
-            res[id(c)] = (src_off, "Quellen-Versatz")
+            res[id(c)] = (typ, "typischer Quellen-Versatz")
     groups = {}
     for off, _ in res.values():
         groups.setdefault(round(off / 0.5) * 0.5, []).append(off)
